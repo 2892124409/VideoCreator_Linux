@@ -1,0 +1,144 @@
+{
+    "project": {
+        "name": "特效测试-带音频",
+        "output_path": "output/effects_test_audio_linux.mp4"
+    },
+    "global_effects": {
+        "audio_encoding": {
+            "codec": "libmp3lame",
+            "bitrate": "192k",
+            "channels": 2
+        }
+    },
+    "scenes": [
+        {
+            "id": 1,
+            "type": "image_scene",
+            "resources": {
+                "image": {
+                    "path": "assets/shot1.png"
+                },
+                "audio": {
+                    "path": "assets/narration1.mp3"
+                }
+            },
+            "effects": {
+                "ken_burns": {
+                    "enabled": true,
+                    "preset": "zoom_in"
+                }
+            }
+        },
+        {
+            "id": 2,
+            "type": "transition",
+            "transition_type": "crossfade",
+            "duration": 1.0
+        },
+        {
+            "id": 3,
+            "type": "image_scene",
+            "resources": {
+                "image": {
+                    "path": "assets/shot2.png"
+                },
+                "audio": {
+                    "path": "assets/narration2.mp3"
+                }
+            },
+            "effects": {
+                "ken_burns": {
+                    "enabled": true,
+                    "preset": "zoom_out"
+                }
+            }
+        },
+        {
+            "id": 4,
+            "type": "transition",
+            "transition_type": "wipe",
+            "duration": 1.0
+        },
+        {
+            "id": 5,
+            "type": "image_scene",
+            "resources": {
+                "image": {
+                    "path": "assets/shot1.png"
+                },
+                "audio": {
+                    "path": "assets/narration1.mp3"
+                }
+            },
+            "effects": {
+                "ken_burns": {
+                    "enabled": true,
+                    "preset": "pan_right"
+                }
+            }
+        },
+        {
+            "id": 6,
+            "type": "transition",
+            "transition_type": "slide",
+            "duration": 1.0
+        },
+        {
+            "id": 7,
+            "type": "image_scene",
+            "resources": {
+                "image": {
+                    "path": "assets/shot2.png"
+                },
+                "audio": {
+                    "path": "assets/narration2.mp3"
+                }
+            },
+            "effects": {
+                "ken_burns": {
+                    "enabled": true,
+                    "preset": "pan_left"
+                }
+            }
+        },
+        {
+            "id": 8,
+            "type": "transition",
+            "transition_type": "crossfade",
+            "duration": 1.0
+        },
+        {
+            "id": 9,
+            "type": "video_scene",
+            "resources": {
+                "video": {
+                    "path": "assets/clip_intro.mp4",
+                    "use_audio": true
+                }
+            }
+        },
+        {
+            "id": 10,
+            "type": "transition",
+            "transition_type": "crossfade",
+            "duration": 1.0
+        },
+        {
+            "id": 11,
+            "type": "video_scene",
+            "resources": {
+                "video": {
+                    "path": "assets/clip_outro.mp4",
+                    "use_audio": true
+                },
+                "audio_layers": [
+                    {
+                        "path": "assets/narration2.mp3",
+                        "volume": 0.8,
+                        "start_offset": 0.0
+                    }
+                ]
+            }
+        }
+    ]
+}
