@@ -5,9 +5,16 @@
 #include <cmath>
 #define qDebug() std::cerr
 
+/**
+ * @file AudioDecoder.cpp
+ * @brief 实现音频解码、重采样及音量滤镜处理。
+ */
+
 namespace VideoCreator
 {
-
+    /**
+     * @brief 构造函数，初始化所有句柄为空。
+     */
     AudioDecoder::AudioDecoder()
         : m_formatContext(nullptr), m_codecContext(nullptr), m_audioStreamIndex(-1),
           m_swrCtx(nullptr), m_filterGraph(nullptr), m_bufferSrcCtx(nullptr), m_bufferSinkCtx(nullptr),
@@ -20,6 +27,9 @@ namespace VideoCreator
         cleanup();
     }
 
+    /**
+     * @brief 打开音频输入并初始化解码器与重采样器。
+     */
     bool AudioDecoder::open(const std::string &filePath)
     {
         // 打开输入文件
@@ -124,6 +134,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 按场景配置应用音量效果。
+     */
     bool AudioDecoder::applyVolumeEffect(const SceneConfig& sceneConfig)
     {
         double trackDuration = sceneConfig.duration > 0 ? sceneConfig.duration : getDuration();
@@ -131,6 +144,9 @@ namespace VideoCreator
         return applyVolumeEffect(sceneConfig.resources.audio.volume, effect, trackDuration);
     }
 
+    /**
+     * @brief 根据显式参数启用音量滤镜链。
+     */
     bool AudioDecoder::applyVolumeEffect(double baseVolume, const VolumeMixEffect* effect, double trackDurationSeconds)
     {
         const bool effectEnabled = effect && effect->enabled;
@@ -143,6 +159,11 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 初始化音频滤镜图（afade + volume）。
+     *
+     * 该滤镜图作用于重采样后的统一格式音频，保证后续混音侧行为一致。
+     */
     bool AudioDecoder::initFilterGraph(double baseVolume, const VolumeMixEffect* effect, double trackDurationSeconds)
     {
         if (m_filterGraph) {
@@ -235,13 +256,25 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 按秒级时间戳 seek 到目标位置。
+     */
     bool AudioDecoder::seek(double timestamp)
     {
         if (!m_formatContext) return false;
         int64_t target_ts = static_cast<int64_t>(timestamp / av_q2d(m_formatContext->streams[m_audioStreamIndex]->time_base));
         return av_seek_frame(m_formatContext, m_audioStreamIndex, target_ts, AVSEEK_FLAG_BACKWARD) >= 0;
     }
-    
+
+    /**
+     * @brief 解码一帧音频并输出 FLTP 44.1kHz 立体声数据。
+     *
+     * 关键流程：
+     * 1. 优先尝试从滤镜图读取（若开启效果）；
+     * 2. 从解码器 receive_frame，必要时 read_frame/send_packet 供数；
+     * 3. 对原始帧做 swr_convert 重采样；
+     * 4. 可选送入滤镜图，再次循环拉取输出。
+     */
     int AudioDecoder::decodeFrame(FFmpegUtils::AvFramePtr &outFrame)
     {
         if (!m_formatContext || !m_codecContext) {
@@ -366,6 +399,9 @@ namespace VideoCreator
         }
     }
 
+    /**
+     * @brief 获取音频时长（秒）。
+     */
     double AudioDecoder::getDuration() const
     {
         if (!m_formatContext || m_audioStreamIndex < 0) {
@@ -380,12 +416,18 @@ namespace VideoCreator
         }
         return 0.0;
     }
-    
+
+    /**
+     * @brief 关闭解码器。
+     */
     void AudioDecoder::close()
     {
         cleanup();
     }
 
+    /**
+     * @brief 清理解码器、重采样器与滤镜图。
+     */
     void AudioDecoder::cleanup()
     {
         if (m_codecContext) {

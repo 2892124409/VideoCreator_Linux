@@ -5,6 +5,11 @@
 #include <iostream>
 #include <sstream>
 
+/**
+ * @file ConfigLoader.cpp
+ * @brief 实现 JSON 配置解析与媒体时长探测逻辑。
+ */
+
 extern "C"
 {
 #include <libavformat/avformat.h>
@@ -15,6 +20,9 @@ namespace VideoCreator
 {
     namespace
     {
+        /**
+         * @brief 生成小写副本，便于大小写无关比较。
+         */
         std::string toLowerCopy(const std::string &value)
         {
             std::string lowered = value;
@@ -23,12 +31,18 @@ namespace VideoCreator
             return lowered;
         }
 
+        /**
+         * @brief 判断文件是否可读。
+         */
         bool isReadableFile(const std::string &path)
         {
             std::ifstream file(path.c_str(), std::ios::binary);
             return file.good();
         }
 
+        /**
+         * @brief 将 FFmpeg 错误码转换为可读字符串。
+         */
         std::string formatFFmpegError(int ret)
         {
             char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -37,6 +51,9 @@ namespace VideoCreator
         }
     } // namespace
 
+    /**
+     * @brief 从 JSON 文件加载配置。
+     */
     bool ConfigLoader::loadFromFile(const std::string &filePath, ProjectConfig &config)
     {
         std::ifstream file(filePath.c_str(), std::ios::binary);
@@ -51,6 +68,15 @@ namespace VideoCreator
         return loadFromString(buffer.str(), config);
     }
 
+    /**
+     * @brief 从 JSON 文本加载配置并填充 ProjectConfig。
+     *
+     * 处理流程：
+     * 1. 清空错误状态和时长缓存；
+     * 2. 解析根 JSON；
+     * 3. 顺序解析 project/scenes/global_effects；
+     * 4. 场景解析阶段补齐默认时长策略。
+     */
     bool ConfigLoader::loadFromString(const std::string &jsonString, ProjectConfig &config)
     {
         m_errorString.clear();
@@ -84,6 +110,7 @@ namespace VideoCreator
 
         if (root.contains("scenes") && root["scenes"].is_array())
         {
+            // 重新编号场景顺序，确保缺省场景也有稳定 ID。
             config.scenes.clear();
             int sceneId = 1;
             for (const auto &sceneValue : root["scenes"])
@@ -115,6 +142,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析项目级字段。
+     */
     bool ConfigLoader::parseProjectConfig(const Json &json, ProjectInfoConfig &project)
     {
         if (json.contains("name") && json["name"].is_string())
@@ -150,6 +180,15 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析单场景并计算最终 duration。
+     *
+     * 优先级规则：
+     * 1. JSON 显式给定 duration 时直接采用；
+     * 2. image_scene 优先按音频时长驱动；
+     * 3. video_scene 优先按视频时长，其次音频时长；
+     * 4. 无法探测时统一回退到 5 秒。
+     */
     bool ConfigLoader::parseSceneConfig(const Json &json, SceneConfig &scene)
     {
         if (json.contains("id") && json["id"].is_number())
@@ -195,10 +234,12 @@ namespace VideoCreator
 
         if (json.contains("duration") && json["duration"].is_number())
         {
+            // 显式时长拥有最高优先级，不再进行自动推断。
             scene.duration = json["duration"].get<double>();
             return true;
         }
 
+        // 汇总主音频与附加音轨时长，取最长轨道驱动场景时长。
         double audioDrivenDuration = -1.0;
         bool hasAudioResource = false;
         auto updateAudioDuration = [&](const std::string &path) {
@@ -273,6 +314,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 resources 节点。
+     */
     bool ConfigLoader::parseResourcesConfig(const Json &json, ResourcesConfig &resources)
     {
         if (json.contains("image") && json["image"].is_object())
@@ -319,6 +363,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 image 节点。
+     */
     bool ConfigLoader::parseImageConfig(const Json &json, ImageConfig &image)
     {
         if (json.contains("path") && json["path"].is_string())
@@ -352,6 +399,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 audio 节点。
+     */
     bool ConfigLoader::parseAudioConfig(const Json &json, AudioConfig &audio)
     {
         if (json.contains("path") && json["path"].is_string())
@@ -372,6 +422,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 video 节点。
+     */
     bool ConfigLoader::parseVideoConfig(const Json &json, VideoConfig &video)
     {
         if (json.contains("path") && json["path"].is_string())
@@ -397,6 +450,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 effects 节点。
+     */
     bool ConfigLoader::parseEffectsConfig(const Json &json, EffectsConfig &effects)
     {
         if (json.contains("ken_burns") && json["ken_burns"].is_object())
@@ -418,6 +474,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 ken_burns 节点。
+     */
     bool ConfigLoader::parseKenBurnsEffect(const Json &json, KenBurnsEffect &effect)
     {
         if (json.contains("enabled") && json["enabled"].is_boolean())
@@ -463,6 +522,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 volume_mix 节点。
+     */
     bool ConfigLoader::parseVolumeMixEffect(const Json &json, VolumeMixEffect &effect)
     {
         if (json.contains("enabled") && json["enabled"].is_boolean())
@@ -483,6 +545,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 global_effects 节点。
+     */
     bool ConfigLoader::parseGlobalEffectsConfig(const Json &json, GlobalEffectsConfig &global_effects)
     {
         if (json.contains("audio_normalization") && json["audio_normalization"].is_object())
@@ -512,6 +577,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 audio_normalization 节点。
+     */
     bool ConfigLoader::parseAudioNormalizationConfig(const Json &json, AudioNormalizationConfig &config)
     {
         if (json.contains("enabled") && json["enabled"].is_boolean())
@@ -527,6 +595,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 video_encoding 节点。
+     */
     bool ConfigLoader::parseVideoEncodingConfig(const Json &json, VideoEncodingConfig &config)
     {
         if (json.contains("codec") && json["codec"].is_string())
@@ -552,6 +623,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解析 audio_encoding 节点。
+     */
     bool ConfigLoader::parseAudioEncodingConfig(const Json &json, AudioEncodingConfig &config)
     {
         if (json.contains("codec") && json["codec"].is_string())
@@ -572,6 +646,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 将场景类型字符串转换为枚举。
+     */
     SceneType ConfigLoader::stringToSceneType(const std::string &typeStr)
     {
         const std::string lowered = toLowerCopy(typeStr);
@@ -590,6 +667,9 @@ namespace VideoCreator
         return SceneType::IMAGE_SCENE;
     }
 
+    /**
+     * @brief 将转场类型字符串转换为枚举。
+     */
     TransitionType ConfigLoader::stringToTransitionType(const std::string &typeStr)
     {
         const std::string lowered = toLowerCopy(typeStr);
@@ -608,6 +688,9 @@ namespace VideoCreator
         return TransitionType::CROSSFADE;
     }
 
+    /**
+     * @brief 获取音频时长（含缓存）。
+     */
     double ConfigLoader::getAudioDuration(const std::string &audioPath)
     {
         const std::string key = normalizedPath(audioPath);
@@ -628,6 +711,9 @@ namespace VideoCreator
         return duration;
     }
 
+    /**
+     * @brief 获取视频时长（含缓存）。
+     */
     double ConfigLoader::getVideoDuration(const std::string &videoPath)
     {
         const std::string key = normalizedPath(videoPath);
@@ -648,6 +734,11 @@ namespace VideoCreator
         return duration;
     }
 
+    /**
+     * @brief 使用 FFmpeg 探测音频文件总时长。
+     *
+     * 优先采用容器级 duration，容器缺失时回退到音频流 duration。
+     */
     double ConfigLoader::probeAudioDuration(const std::string &audioPath)
     {
         if (audioPath.empty())
@@ -699,10 +790,12 @@ namespace VideoCreator
         double duration = 0.0;
         if (formatCtx->duration != AV_NOPTS_VALUE)
         {
+            // 容器级时长精度更稳定，优先使用。
             duration = formatCtx->duration / static_cast<double>(AV_TIME_BASE);
         }
         else if (formatCtx->streams[audioStreamIndex]->duration != AV_NOPTS_VALUE)
         {
+            // 对某些容器，只有流级时长可用。
             AVStream *stream = formatCtx->streams[audioStreamIndex];
             duration = stream->duration * av_q2d(stream->time_base);
         }
@@ -711,6 +804,9 @@ namespace VideoCreator
         return duration > 0 ? duration : -1.0;
     }
 
+    /**
+     * @brief 使用 FFmpeg 探测视频文件总时长。
+     */
     double ConfigLoader::probeVideoDuration(const std::string &videoPath)
     {
         if (videoPath.empty())
@@ -762,10 +858,12 @@ namespace VideoCreator
         double duration = 0.0;
         if (formatCtx->duration != AV_NOPTS_VALUE)
         {
+            // 优先读取容器总时长。
             duration = formatCtx->duration / static_cast<double>(AV_TIME_BASE);
         }
         else if (formatCtx->streams[videoStreamIndex]->duration != AV_NOPTS_VALUE)
         {
+            // 备用路径：读取视频流时长。
             AVStream *stream = formatCtx->streams[videoStreamIndex];
             duration = stream->duration * av_q2d(stream->time_base);
         }
@@ -774,6 +872,9 @@ namespace VideoCreator
         return duration > 0 ? duration : -1.0;
     }
 
+    /**
+     * @brief 规范化路径，提升缓存命中率。
+     */
     std::string ConfigLoader::normalizedPath(const std::string &path) const
     {
         if (path.empty())

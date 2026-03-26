@@ -1,13 +1,20 @@
-﻿#include "EffectProcessor.h"
+#include "EffectProcessor.h"
 #include <sstream>
 #include <cmath>
 #include <locale>
 #include <iomanip> // For std::setprecision
 #include <libavutil/opt.h>
 
+/**
+ * @file EffectProcessor.cpp
+ * @brief 实现基于 FFmpeg filter graph 的 Ken Burns 与转场效果处理。
+ */
+
 namespace VideoCreator
 {
-
+    /**
+     * @brief 构造并初始化成员默认值。
+     */
     EffectProcessor::EffectProcessor()
         : m_filterGraph(nullptr), m_buffersrcContext(nullptr), m_buffersrcContext2(nullptr), m_buffersinkContext(nullptr),
           m_width(0), m_height(0), m_pixelFormat(AV_PIX_FMT_NONE), m_fps(0),
@@ -20,6 +27,9 @@ namespace VideoCreator
         cleanup();
     }
 
+    /**
+     * @brief 设置输出参数并重置序列状态。
+     */
     bool EffectProcessor::initialize(int width, int height, AVPixelFormat format, int fps)
     {
         m_width = width;
@@ -31,6 +41,14 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 启动 Ken Burns 序列并将输入图像写入滤镜图。
+     *
+     * 关键步骤：
+     * 1. 根据 preset 或手工参数组装 zoompan 表达式；
+     * 2. 初始化单输入滤镜图；
+     * 3. 写入首帧并发送 EOF，转入“按帧拉取”模式。
+     */
     bool EffectProcessor::startKenBurnsSequence(const KenBurnsEffect& effect, const AVFrame* inputImage, int total_frames)
     {
         resetSequenceState();
@@ -51,6 +69,7 @@ namespace VideoCreator
         std::stringstream ss;
         ss.imbue(std::locale("C"));
 
+        // 预设模式：统一封装常用镜头运动参数，降低配置复杂度。
         if (params.preset == "zoom_in" || params.preset == "zoom_out")
         {
             double start_z = (params.preset == "zoom_in") ? 1.0 : 1.2;
@@ -93,6 +112,7 @@ namespace VideoCreator
                << "d=" << total_frames << ":s=" << m_width << "x" << m_height << ":fps=" << m_fps;
         }
 
+        // 生成滤镜图并写入源帧。
         if (!initFilterGraph(ss.str())) {
             return false;
         }
@@ -122,6 +142,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 获取下一帧 Ken Burns 输出。
+     */
     bool EffectProcessor::fetchKenBurnsFrame(FFmpegUtils::AvFramePtr &outFrame)
     {
         if (m_sequenceType != SequenceType::KenBurns) {
@@ -142,6 +165,14 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 启动转场序列。
+     *
+     * 关键步骤：
+     * 1. 把内部转场枚举映射为 xfade transition 名称；
+     * 2. 创建双输入滤镜图并显式补齐色彩信息；
+     * 3. 写入 from/to 帧并发送 EOF，再由 fetchTransitionFrame 拉取结果。
+     */
     bool EffectProcessor::startTransitionSequence(TransitionType type, const AVFrame* fromFrame, const AVFrame* toFrame, int duration_frames)
     {
         resetSequenceState();
@@ -175,6 +206,7 @@ namespace VideoCreator
         std::stringstream ss;
         ss.imbue(std::locale("C"));
         ss << std::fixed << std::setprecision(5);
+        // tpad 用于在输入不足时复制边界帧，确保 xfade 在完整时间窗内有稳定输入。
         ss << "[in0]tpad=stop_mode=clone:stop_duration=" << transition_duration_sec << "[s0];"
            << "[in1]tpad=stop_mode=clone:stop_duration=" << transition_duration_sec << "[s1];"
            << "[s0][s1]xfade=transition=" << transitionName
@@ -225,6 +257,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 获取下一帧转场输出。
+     */
     bool EffectProcessor::fetchTransitionFrame(FFmpegUtils::AvFramePtr &outFrame)
     {
         if (m_sequenceType != SequenceType::Transition) {
@@ -245,6 +280,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 从 buffersink 拉取单帧输出并补齐色彩元信息。
+     */
     bool EffectProcessor::retrieveFrame(FFmpegUtils::AvFramePtr &outFrame)
     {
         if (!m_buffersinkContext) {
@@ -268,6 +306,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 对输出帧显式写入色彩空间信息，避免后续链路隐式推断。
+     */
     void EffectProcessor::stampFrameColorInfo(AVFrame *frame) const
     {
         if (!frame) {
@@ -281,6 +322,9 @@ namespace VideoCreator
         frame->sample_aspect_ratio = AVRational{1, 1};
     }
 
+    /**
+     * @brief 清空序列计数状态。
+     */
     void EffectProcessor::resetSequenceState()
     {
         m_sequenceType = SequenceType::None;
@@ -288,11 +332,17 @@ namespace VideoCreator
         m_generatedFrames = 0;
     }
 
+    /**
+     * @brief 对外关闭接口。
+     */
     void EffectProcessor::close()
     {
         cleanup();
     }
 
+    /**
+     * @brief 释放滤镜图和节点上下文。
+     */
     void EffectProcessor::cleanup()
     {
         resetSequenceState();
@@ -305,6 +355,9 @@ namespace VideoCreator
         m_buffersinkContext = nullptr;
     }
 
+    /**
+     * @brief 初始化单输入滤镜图（Ken Burns）。
+     */
     bool EffectProcessor::initFilterGraph(const std::string &filterDescription)
     {
         cleanup();
@@ -333,6 +386,7 @@ namespace VideoCreator
         }
         
         colorspace = (m_height >= 720) ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+        // 强制写入色彩元信息，避免 filter 链路自动协商导致偏色。
         av_opt_set_int(m_buffersrcContext, "color_range", AVCOL_RANGE_MPEG, 0);
         av_opt_set_int(m_buffersrcContext, "colorspace", colorspace, 0);
         av_opt_set_int(m_buffersrcContext, "color_primaries", (m_height >= 720) ? AVCOL_PRI_BT709 : AVCOL_PRI_SMPTE170M, 0);
@@ -374,6 +428,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 初始化双输入滤镜图（转场）。
+     */
     bool EffectProcessor::initTransitionFilterGraph(const std::string& filter_description)
     {
         cleanup();
@@ -401,6 +458,7 @@ namespace VideoCreator
         }
 
         colorspace = (m_height >= 720) ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+        // 两路输入必须使用同一色彩元数据，保证 xfade 输出一致性。
         av_opt_set_int(m_buffersrcContext, "color_range", AVCOL_RANGE_MPEG, 0);
         av_opt_set_int(m_buffersrcContext, "colorspace", colorspace, 0);
         av_opt_set_int(m_buffersrcContext, "color_primaries", (m_height >= 720) ? AVCOL_PRI_BT709 : AVCOL_PRI_SMPTE170M, 0);

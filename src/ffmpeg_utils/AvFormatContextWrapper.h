@@ -4,22 +4,40 @@
 #include <memory>
 #include "FFmpegHeaders.h"
 
-namespace FFmpegUtils {
+/**
+ * @file AvFormatContextWrapper.h
+ * @brief AVFormatContext RAII 定义。
+ */
 
-// AVFormatContext custom deleter
-struct AvFormatContextDeleter {
-    void operator()(AVFormatContext* context) const {
-        if (context) {
-            if (context->pb) {
-                avio_closep(&context->pb);
+namespace FFmpegUtils
+{
+
+    /**
+     * @brief AVFormatContext 自定义删除器。
+     */
+    struct AvFormatContextDeleter
+    {
+        /**
+         * @brief 关闭并释放 AVFormatContext。
+         * @param context 待释放上下文。
+         */
+        void operator()(AVFormatContext *context) const
+        {
+            if (context)
+            {
+                if (context->pb)
+                {
+                    avio_closep(&context->pb);
+                }
+                avformat_free_context(context);
             }
-            avformat_free_context(context);
         }
-    }
-};
+    };
 
-// AVFormatContext smart pointer for output contexts
-using AvFormatContextPtr = std::unique_ptr<AVFormatContext, AvFormatContextDeleter>;
+    /**
+     * @brief AVFormatContext 智能指针别名（主要用于输出上下文）。
+     */
+    using AvFormatContextPtr = std::unique_ptr<AVFormatContext, AvFormatContextDeleter>;
 
 } // namespace FFmpegUtils
 

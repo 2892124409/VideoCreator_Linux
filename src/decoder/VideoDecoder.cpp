@@ -3,9 +3,16 @@
 #include "ffmpeg_utils/AvPacketWrapper.h"
 #define qDebug() std::cerr
 
+/**
+ * @file VideoDecoder.cpp
+ * @brief 实现视频解码与逐帧缩放转换。
+ */
+
 namespace VideoCreator
 {
-
+    /**
+     * @brief 构造函数。
+     */
     VideoDecoder::VideoDecoder()
         : m_formatContext(nullptr), m_codecContext(nullptr), m_swsContext(nullptr),
           m_videoStreamIndex(-1), m_timeBase{1, 1}, m_frameRate(0.0), m_duration(0)
@@ -17,6 +24,9 @@ namespace VideoCreator
         cleanup();
     }
 
+    /**
+     * @brief 打开视频文件并初始化解码上下文。
+     */
     bool VideoDecoder::open(const std::string &filePath)
     {
         if (avformat_open_input(&m_formatContext, filePath.c_str(), nullptr, nullptr) < 0)
@@ -98,6 +108,12 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解码下一帧视频。
+     *
+     * 解码流程会在 `receive_frame` 与 `send_packet` 之间循环，
+     * 直到拿到一帧、到达 EOF 或出现错误。
+     */
     int VideoDecoder::decodeFrame(FFmpegUtils::AvFramePtr &frame)
     {
         if (!m_formatContext || !m_codecContext)
@@ -153,6 +169,9 @@ namespace VideoCreator
         }
     }
 
+    /**
+     * @brief 缩放并转换帧格式，同时保留色彩空间信息。
+     */
     FFmpegUtils::AvFramePtr VideoDecoder::scaleFrame(const AVFrame *frame, int targetWidth, int targetHeight, AVPixelFormat targetFormat)
     {
         if (!frame)
@@ -207,6 +226,9 @@ namespace VideoCreator
         return scaledFrame;
     }
 
+    /**
+     * @brief 获取视频时长（秒）。
+     */
     double VideoDecoder::getDuration() const
     {
         if (!m_formatContext || m_videoStreamIndex < 0)
@@ -222,11 +244,17 @@ namespace VideoCreator
         return 0.0;
     }
 
+    /**
+     * @brief 关闭解码器。
+     */
     void VideoDecoder::close()
     {
         cleanup();
     }
 
+    /**
+     * @brief 清理 FFmpeg 资源。
+     */
     void VideoDecoder::cleanup()
     {
         if (m_swsContext)

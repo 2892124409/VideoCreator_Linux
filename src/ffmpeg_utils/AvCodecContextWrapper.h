@@ -4,19 +4,36 @@
 #include <memory>
 #include "FFmpegHeaders.h"
 
-namespace FFmpegUtils {
+/**
+ * @file AvCodecContextWrapper.h
+ * @brief AVCodecContext RAII 定义。
+ */
 
-// AVCodecContext custom deleter
-struct AvCodecContextDeleter {
-    void operator()(AVCodecContext* context) const {
-        if (context) {
-            avcodec_free_context(&context);
+namespace FFmpegUtils
+{
+
+    /**
+     * @brief AVCodecContext 自定义删除器。
+     */
+    struct AvCodecContextDeleter
+    {
+        /**
+         * @brief 释放 AVCodecContext。
+         * @param context 待释放上下文。
+         */
+        void operator()(AVCodecContext *context) const
+        {
+            if (context)
+            {
+                avcodec_free_context(&context);
+            }
         }
-    }
-};
+    };
 
-// AVCodecContext smart pointer
-using AvCodecContextPtr = std::unique_ptr<AVCodecContext, AvCodecContextDeleter>;
+    /**
+     * @brief AVCodecContext 智能指针别名。
+     */
+    using AvCodecContextPtr = std::unique_ptr<AVCodecContext, AvCodecContextDeleter>;
 
 } // namespace FFmpegUtils
 

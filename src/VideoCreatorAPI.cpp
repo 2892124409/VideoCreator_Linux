@@ -6,10 +6,18 @@
 #include "engine/RenderEngine.h"
 #include "ffmpeg_utils/FFmpegHeaders.h"
 
+/**
+ * @file VideoCreatorAPI.cpp
+ * @brief 实现对外渲染 API。
+ */
+
 namespace VideoCreator
 {
     namespace
     {
+        /**
+         * @brief 确保 FFmpeg 网络模块只初始化一次。
+         */
         bool ensureFFmpegInitialized(std::string *error)
         {
             static std::once_flag initFlag;
@@ -37,6 +45,9 @@ namespace VideoCreator
             return true;
         }
 
+        /**
+         * @brief 使用已解析配置执行渲染。
+         */
         bool renderWithConfig(const ProjectConfig &config, std::string *error)
         {
             RenderEngine engine;
@@ -60,6 +71,9 @@ namespace VideoCreator
         }
     } // namespace
 
+    /**
+     * @brief 从 JSON 文件渲染视频。
+     */
     bool RenderFromJson(const std::string &config_path, std::string *error)
     {
         if (!ensureFFmpegInitialized(error))
@@ -81,6 +95,9 @@ namespace VideoCreator
         return renderWithConfig(config, error);
     }
 
+    /**
+     * @brief 从 JSON 字符串渲染视频。
+     */
     bool RenderFromJsonString(const std::string &json_string, std::string *error)
     {
         if (!ensureFFmpegInitialized(error))

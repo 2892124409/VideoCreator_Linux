@@ -1,7 +1,11 @@
 #ifndef FFMPEG_HEADERS_H
 #define FFMPEG_HEADERS_H
 
-// 统一包含FFmpeg头文件，处理C++兼容性
+/**
+ * @file FFmpegHeaders.h
+ * @brief 统一包含 FFmpeg 头文件并处理 C/C++ 语言链接兼容。
+ */
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>

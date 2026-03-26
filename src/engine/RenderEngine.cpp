@@ -17,23 +17,34 @@
 #include <atomic>
 #define qDebug() std::cerr
 
+/**
+ * @file RenderEngine.cpp
+ * @brief 实现视频合成主流程（场景渲染、转场、混音、编码与封装）。
+ */
+
 namespace VideoCreator
 {
 
-    // Helper to generate FFmpeg error messages
+    /**
+     * @brief 组装 FFmpeg 错误信息。
+     */
     static std::string format_ffmpeg_error(int ret, const std::string& message) {
         char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
         return message + ": " + errbuf + " (code " + std::to_string(ret) + ")";
     }
 
-    // C++11/14 compatible clamp helper.
+    /**
+     * @brief C++11/14 兼容的 clamp 辅助函数。
+     */
     template <typename T>
     static T clamp_value(T value, T low, T high) {
         return std::max(low, std::min(value, high));
     }
 
-    // Helper to parse bitrate strings (e.g., "5000k", "5M")
+    /**
+     * @brief 解析码率字符串（例如 "5000k"、"5M"）。
+     */
     static int64_t parseBitrate(const std::string& bitrateStr) {
         if (bitrateStr.empty()) {
             return 0;
@@ -70,7 +81,9 @@ namespace VideoCreator
         }
     }
 
-
+    /**
+     * @brief 构造渲染引擎。
+     */
     RenderEngine::RenderEngine()
         : m_videoStream(nullptr), m_audioStream(nullptr), m_audioFifo(nullptr), m_frameCount(0), m_audioSamplesCount(0), m_progress(0),
           m_totalProjectFrames(0), m_lastReportedProgress(-1), m_enableAudioTransition(false),
@@ -85,6 +98,15 @@ namespace VideoCreator
         }
     }
 
+    /**
+     * @brief 初始化渲染上下文。
+     *
+     * 初始化步骤：
+     * 1. 重置内部计数、缓存与预取任务；
+     * 2. 基于场景时长预估总帧数用于进度汇报；
+     * 3. 创建输出容器与视频/音频编码流；
+     * 4. 写入容器头。
+     */
     bool RenderEngine::initialize(const ProjectConfig &config)
     {
         m_config = config;
@@ -127,6 +149,12 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 执行全项目渲染。
+     *
+     * 主循环按配置顺序遍历 scenes，普通场景走 renderScene，
+     * 转场场景走 renderTransition。结束后统一 flush 音频/视频编码器。
+     */
     bool RenderEngine::render()
     {
         qDebug() << "开始渲染所有场景，总共" << m_config.scenes.size() << "个场景";
@@ -176,6 +204,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 创建输出封装上下文并打开目标文件。
+     */
     bool RenderEngine::createOutputContext()
     {
         AVFormatContext* temp_ctx = nullptr;
@@ -196,6 +227,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 创建视频编码流。
+     */
     bool RenderEngine::createVideoStream()
     {
         const AVCodec *videoCodec = avcodec_find_encoder_by_name(m_config.global_effects.video_encoding.codec.c_str());
@@ -250,6 +284,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 创建音频编码流和 FIFO。
+     */
     bool RenderEngine::createAudioStream()
     {
         const AVCodec *audioCodec = avcodec_find_encoder_by_name(m_config.global_effects.audio_encoding.codec.c_str());
@@ -302,6 +339,16 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 渲染单个普通场景。
+     *
+     * 实现细节：
+     * 1. 根据场景类型初始化图片/视频解码器；
+     * 2. 启动异步视频取帧线程和多音轨解码线程；
+     * 3. 以时间轴驱动“写视频帧 or 写音频帧”；
+     * 4. 缓存首尾帧，为转场复用；
+     * 5. 将混音结果写入 FIFO 并编码输出。
+     */
     bool RenderEngine::renderScene(const SceneConfig &scene)
     {
         struct SceneAudioLayer
@@ -386,6 +433,7 @@ namespace VideoCreator
 
         const bool isVideoScene = scene.type == SceneType::VIDEO_SCENE;
         if (isVideoScene) {
+            // 预取结果按需落地到缓存，避免主线程阻塞解码首帧。
             resolveScenePrefetch(scene);
         }
 
@@ -428,6 +476,7 @@ namespace VideoCreator
         if (isVideoScene && videoSourceAvailable)
         {
             const size_t maxVideoQueueSize = 8;
+            // 异步视频线程：持续解码并缩放后塞入有界队列，主线程按需消费。
             videoThreadGuard.worker = std::thread([&, maxVideoQueueSize]() {
                 while (true)
                 {
@@ -496,6 +545,7 @@ namespace VideoCreator
             std::vector<AudioConfig> transientAudioConfigs;
             auto startAudioLayerWorker = [&](SceneAudioLayer &layerRef) {
                 SceneAudioLayer *layerPtr = &layerRef;
+                // 每个音轨独立线程解码，输出 float 双声道采样到环形队列。
                 layerRef.worker = std::thread([layerPtr, maxBufferedSamples]() {
                     while (true) {
                         {
@@ -706,6 +756,7 @@ namespace VideoCreator
             }
 
             if (!hasActiveLayer && !hasPendingAudio) {
+                // 所有音轨都结束后，补静音保持音视频时间轴连续。
                 return enqueueSilenceFrame(samplesNeeded);
             }
 
@@ -773,6 +824,7 @@ namespace VideoCreator
         bool videoEOF = false;
         FFmpegUtils::AvFramePtr lastFrameCopy;
 
+        // 主渲染循环：按“谁时间戳更落后就先推进谁”的策略交织写入音视频。
         while (m_frameCount < startFrameCount + totalVideoFramesInScene)
         {
             double video_time = (double)m_frameCount / m_config.project.fps;
@@ -810,11 +862,13 @@ namespace VideoCreator
                     lock.unlock();
                     videoFrameQueue.cv.notify_all();
                 } else if (kenBurnsActive) {
+                    // 图片场景 + Ken Burns：从特效序列按帧拉取。
                     if (!effectProcessor.fetchKenBurnsFrame(videoFrame)) {
                         m_errorString = "获取Ken Burns缓存帧失败: " + effectProcessor.getErrorString();
                         return false;
                     }
                 } else {
+                    // 静态图片场景：复用同一源帧。
                     videoFrame = FFmpegUtils::copyAvFrame(sourceImageFrame.get());
                 }
 
@@ -870,6 +924,15 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 渲染场景转场。
+     *
+     * 核心逻辑：
+     * 1. 解析并准备 from/to 参考帧（优先缓存，其次按场景实时提取）；
+     * 2. 交给 EffectProcessor 运行 xfade 序列；
+     * 3. 同步补齐转场期间音频（静音或可选混音）；
+     * 4. 写入编码器并更新进度。
+     */
     bool RenderEngine::renderTransition(const SceneConfig &transitionScene, const SceneConfig &fromScene, const SceneConfig &toScene)
     {
         int64_t startAudioSampleCount = m_audioSamplesCount;
@@ -883,7 +946,7 @@ namespace VideoCreator
         
         ImageDecoder fromDecoder, toDecoder;
 
-        // --- Determine the correct FROM frame ---
+        // 1) 确定起始帧（优先末帧缓存，避免重复计算）。
         FFmpegUtils::AvFramePtr finalFromFrame;
         auto cachedFromFrame = getCachedSceneFrame(fromScene, true);
         bool fromFrameFromCache = static_cast<bool>(cachedFromFrame);
@@ -973,7 +1036,7 @@ namespace VideoCreator
             return false;
         }
 
-        // --- Determine the correct TO frame (prefer特效首帧) ---
+        // 2) 确定目标帧（优先首帧缓存，必要时根据 Ken Burns 计算首帧）。
         FFmpegUtils::AvFramePtr scaledToFrame;
         auto cachedToFrame = getCachedSceneFrame(toScene, false);
         bool toFrameFromCache = static_cast<bool>(cachedToFrame);
@@ -1054,7 +1117,7 @@ namespace VideoCreator
         if (!toFrameFromCache && scaledToFrame) {
             cacheSceneFirstFrame(toScene, scaledToFrame.get());
         }
-        // --- Apply transition ---
+        // 3) 应用转场滤镜并逐帧写入编码器。
         EffectProcessor transitionProcessor;
         transitionProcessor.initialize(m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P, m_config.project.fps);
         if (!transitionProcessor.startTransitionSequence(transitionScene.transition_type, finalFromFrame.get(), scaledToFrame.get(), totalFrames)) {
@@ -1131,6 +1194,11 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 生成音频转场混音（可选功能）。
+     *
+     * 使用线性权重对 from/to 两段音频做 cross-fade，并写入音频 FIFO。
+     */
     bool RenderEngine::renderAudioTransition(const SceneConfig &fromScene, const SceneConfig &toScene, double duration_seconds)
     {
         if (!m_audioStream || !m_audioCodecContext || duration_seconds <= 0.0) return true;
@@ -1289,6 +1357,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 从视频场景提取首帧或末帧并缩放到输出尺寸。
+     */
     FFmpegUtils::AvFramePtr RenderEngine::extractVideoSceneFrame(const SceneConfig &scene, bool fetchLastFrame)
     {
         if (scene.type != SceneType::VIDEO_SCENE) {
@@ -1336,6 +1407,9 @@ namespace VideoCreator
         return selectedFrame;
     }
 
+    /**
+     * @brief 为视频场景安排首帧预取任务。
+     */
     void RenderEngine::scheduleVideoPrefetchTasks()
     {
         m_sceneFirstFramePrefetch.clear();
@@ -1372,6 +1446,9 @@ namespace VideoCreator
         }
     }
 
+    /**
+     * @brief 解析并缓存某个场景的预取首帧结果。
+     */
     void RenderEngine::resolveScenePrefetch(const SceneConfig &scene)
     {
         auto it = m_sceneFirstFramePrefetch.find(scene.id);
@@ -1385,6 +1462,9 @@ namespace VideoCreator
         }
     }
 
+    /**
+     * @brief 为混音准备可复用音频帧，避免高频分配。
+     */
     bool RenderEngine::ensureReusableAudioFrame(int samplesNeeded)
     {
         if (!m_audioCodecContext) {
@@ -1418,7 +1498,9 @@ namespace VideoCreator
         return true;
     }
 
-
+    /**
+     * @brief 写入场景帧缓存。
+     */
     void RenderEngine::storeSceneFrame(std::unordered_map<int, FFmpegUtils::AvFramePtr> &cache, const SceneConfig &scene, FFmpegUtils::AvFramePtr frame)
     {
         if (!frame) {
@@ -1427,6 +1509,9 @@ namespace VideoCreator
         cache[scene.id] = std::move(frame);
     }
 
+    /**
+     * @brief 缓存场景首帧。
+     */
     void RenderEngine::cacheSceneFirstFrame(const SceneConfig &scene, const AVFrame *frame)
     {
         if (!frame) {
@@ -1438,6 +1523,9 @@ namespace VideoCreator
         storeSceneFrame(m_sceneFirstFrames, scene, FFmpegUtils::copyAvFrame(frame));
     }
 
+    /**
+     * @brief 缓存场景末帧。
+     */
     void RenderEngine::cacheSceneLastFrame(const SceneConfig &scene, const AVFrame *frame)
     {
         if (!frame) {
@@ -1446,6 +1534,9 @@ namespace VideoCreator
         storeSceneFrame(m_sceneLastFrames, scene, FFmpegUtils::copyAvFrame(frame));
     }
 
+    /**
+     * @brief 获取缓存场景帧副本。
+     */
     FFmpegUtils::AvFramePtr RenderEngine::getCachedSceneFrame(const SceneConfig &scene, bool lastFrame)
     {
         if (!lastFrame) {
@@ -1459,7 +1550,9 @@ namespace VideoCreator
         return nullptr;
     }
 
-
+    /**
+     * @brief 生成测试图案帧（回退路径）。
+     */
     FFmpegUtils::AvFramePtr RenderEngine::generateTestFrame(int frameIndex, int width, int height)
     {
         auto frame = FFmpegUtils::createAvFrame(width, height, AV_PIX_FMT_YUV420P);
@@ -1480,7 +1573,10 @@ namespace VideoCreator
         }
         return frame;
     }
-    
+
+    /**
+     * @brief 从 FIFO 取满一帧音频并编码输出。
+     */
     bool RenderEngine::sendBufferedAudioFrames()
     {
         if (!m_audioFifo || !m_audioCodecContext) return true; // Return true if no audio configured
@@ -1529,6 +1625,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 冲洗音频 FIFO（不足一帧时补静音对齐）。
+     */
     bool RenderEngine::flushAudio()
     {
         if (!m_audioFifo || !m_audioCodecContext) return true;
@@ -1559,7 +1658,9 @@ namespace VideoCreator
     }
 
 
-
+    /**
+     * @brief 冲洗编码器并写出剩余包。
+     */
     bool RenderEngine::flushEncoder(AVCodecContext *codecCtx, AVStream *stream)
     {
         if (!codecCtx || !stream) return true;
@@ -1589,6 +1690,9 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 计算并更新渲染进度。
+     */
     void RenderEngine::updateAndReportProgress()
     {
         if (m_totalProjectFrames > 0) {

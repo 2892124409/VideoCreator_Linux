@@ -5,11 +5,24 @@
 #include "engine/RenderEngine.h"
 #include "ffmpeg_utils/FFmpegHeaders.h"
 
+/**
+ * @file main.cpp
+ * @brief 项目示例入口，展示配置加载与渲染流程。
+ */
+
 using namespace VideoCreator;
 
+/**
+ * @brief 控制台演示器，用于演示最小可运行渲染流程。
+ */
 class VideoCreatorDemo
 {
 public:
+    /**
+     * @brief 运行演示流程。
+     *
+     * 优先从 `test_config.json` 加载配置，失败时回退到内置示例配置。
+     */
     void runDemo()
     {
         std::cout << "=== VideoCreatorCpp Demo ===\n";
@@ -85,6 +98,9 @@ public:
     }
 
 private:
+    /**
+     * @brief 打印项目摘要信息。
+     */
     void printProjectInfo(const ProjectConfig &config)
     {
         std::cout << "Project info:\n";
@@ -102,6 +118,9 @@ private:
         }
     }
 
+    /**
+     * @brief 构造一个内置演示配置。
+     */
     void createDemoConfig(ProjectConfig &config)
     {
         config.project.name = "Demo Project";
@@ -146,6 +165,9 @@ private:
     }
 };
 
+/**
+ * @brief 程序入口。
+ */
 int main()
 {
     VideoCreatorDemo demo;

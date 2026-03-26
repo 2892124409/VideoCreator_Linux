@@ -2,9 +2,16 @@
 #include <iostream>
 #define qDebug() std::cerr
 
+/**
+ * @file ImageDecoder.cpp
+ * @brief 实现图片解码与缩放转换逻辑。
+ */
+
 namespace VideoCreator
 {
-
+    /**
+     * @brief 构造函数，初始化成员为空状态。
+     */
     ImageDecoder::ImageDecoder()
         : m_formatContext(nullptr), m_codecContext(nullptr), m_videoStreamIndex(-1),
           m_width(0), m_height(0), m_pixelFormat(AV_PIX_FMT_NONE), m_swsContext(nullptr), m_cachedFrame(nullptr)
@@ -16,6 +23,9 @@ namespace VideoCreator
         cleanup();
     }
 
+    /**
+     * @brief 打开图片并初始化 FFmpeg 解码器。
+     */
     bool ImageDecoder::open(const std::string &filePath)
     {
         qDebug() << "打开图片文件: " << filePath.c_str();
@@ -92,6 +102,12 @@ namespace VideoCreator
         return true;
     }
 
+    /**
+     * @brief 解码图片帧。
+     *
+     * 对静态图片通常只会得到一帧，函数同时处理 EOF 刷新逻辑，
+     * 以兼容不同 demuxer/decoder 的行为差异。
+     */
     FFmpegUtils::AvFramePtr ImageDecoder::decode()
     {
         if (!m_formatContext || !m_codecContext)
@@ -170,6 +186,9 @@ namespace VideoCreator
         return frame;
     }
 
+    /**
+     * @brief 读取并缓存首帧，后续返回缓存副本。
+     */
     FFmpegUtils::AvFramePtr ImageDecoder::decodeAndCache()
     {
         // 缓存第一帧，避免重复解码
@@ -181,12 +200,21 @@ namespace VideoCreator
         m_cachedFrame = decode();
         return FFmpegUtils::copyAvFrame(m_cachedFrame.get());
     }
-    
+
+    /**
+     * @brief 关闭解码器。
+     */
     void ImageDecoder::close()
     {
         cleanup();
     }
-    
+
+    /**
+     * @brief 缩放并转换像素格式，同时显式控制色彩空间参数。
+     *
+     * 该函数会将输入帧色彩元数据映射到 swscale 转换参数，避免
+     * 由于隐式推断导致的偏色问题。
+     */
     FFmpegUtils::AvFramePtr ImageDecoder::scaleToSize(FFmpegUtils::AvFramePtr& frame, int targetWidth, int targetHeight, AVPixelFormat targetFormat)
     {
         if (!frame)
@@ -248,9 +276,13 @@ namespace VideoCreator
         scaledFrame->color_primaries = (frame->height >= 720) ? AVCOL_PRI_BT709 : AVCOL_PRI_SMPTE170M;
         scaledFrame->color_trc = (frame->height >= 720) ? AVCOL_TRC_BT709 : AVCOL_TRC_SMPTE170M;
         scaledFrame->sample_aspect_ratio = AVRational{1, 1};
-    
+
         return scaledFrame;
-    }    
+    }
+
+    /**
+     * @brief 清理内部 FFmpeg 资源和缓存状态。
+     */
     void ImageDecoder::cleanup()
     {
         m_cachedFrame.reset(); // 清除缓存
