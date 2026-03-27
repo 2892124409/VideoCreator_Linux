@@ -1,21 +1,20 @@
 #include "RenderEngine.h"
-#include "decoder/ImageDecoder.h"
 #include "decoder/AudioDecoder.h"
+#include "decoder/ImageDecoder.h"
 #include "decoder/VideoDecoder.h"
-#include "filter/EffectProcessor.h"
 #include "ffmpeg_utils/AvFrameWrapper.h"
 #include "ffmpeg_utils/AvPacketWrapper.h"
-#include <iostream>
-#include <vector>
-#include <deque>
+#include "filter/EffectProcessor.h"
 #include <algorithm>
-#include <cmath>
-#include <thread>
-#include <future>
-#include <mutex>
-#include <condition_variable>
 #include <atomic>
-#define qDebug() std::cerr
+#include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <future>
+#include <iostream>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 /**
  * @file RenderEngine.cpp
@@ -25,459 +24,521 @@
 namespace VideoCreator
 {
 
-    /**
-     * @brief 组装 FFmpeg 错误信息。
-     */
-    static std::string format_ffmpeg_error(int ret, const std::string& message) {
-        char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
-        av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
-        return message + ": " + errbuf + " (code " + std::to_string(ret) + ")";
-    }
+/**
+ * @brief 组装 FFmpeg 错误信息。
+ */
+static std::string format_ffmpeg_error(int ret, const std::string& message)
+{
+    char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+    av_strerror(ret, errbuf, AV_ERROR_MAX_STRING_SIZE);
+    return message + ": " + errbuf + " (code " + std::to_string(ret) + ")";
+}
 
-    /**
-     * @brief C++11/14 兼容的 clamp 辅助函数。
-     */
-    template <typename T>
-    static T clamp_value(T value, T low, T high) {
-        return std::max(low, std::min(value, high));
-    }
+/**
+ * @brief C++11/14 兼容的 clamp 辅助函数。
+ */
+template <typename T> static T clamp_value(T value, T low, T high)
+{
+    return std::max(low, std::min(value, high));
+}
 
-    /**
-     * @brief 解析码率字符串（例如 "5000k"、"5M"）。
-     */
-    static int64_t parseBitrate(const std::string& bitrateStr) {
-        if (bitrateStr.empty()) {
-            return 0;
-        }
-        char last_char = bitrateStr.back();
-        std::string num_part = bitrateStr;
-        int64_t multiplier = 1;
-
-        if (last_char == 'k' || last_char == 'K') {
-            multiplier = 1000;
-            num_part.pop_back();
-        } else if (last_char == 'm' || last_char == 'M') {
-            multiplier = 1000000;
-            num_part.pop_back();
-        }
-
-        try {
-            // Trim whitespace from num_part before conversion
-            size_t first = num_part.find_first_not_of(" \t\n\r");
-            if (std::string::npos == first) {
-                 qDebug() << "Invalid bitrate value (only whitespace): " << bitrateStr.c_str();
-                 return 0;
-            }
-            size_t last = num_part.find_last_not_of(" \t\n\r");
-            num_part = num_part.substr(first, (last - first + 1));
-
-            return static_cast<int64_t>(std::stoll(num_part) * multiplier);
-        } catch (const std::invalid_argument& e) {
-            qDebug() << "Invalid bitrate value: " << bitrateStr.c_str();
-            return 0;
-        } catch (const std::out_of_range& e) {
-            qDebug() << "Bitrate value out of range: " << bitrateStr.c_str();
-            return 0;
-        }
-    }
-
-    /**
-     * @brief 构造渲染引擎。
-     */
-    RenderEngine::RenderEngine()
-        : m_videoStream(nullptr), m_audioStream(nullptr), m_audioFifo(nullptr), m_frameCount(0), m_audioSamplesCount(0), m_progress(0),
-          m_totalProjectFrames(0), m_lastReportedProgress(-1), m_enableAudioTransition(false),
-          m_reusableMixFrameCapacity(0)
+/**
+ * @brief 解析码率字符串（例如 "5000k"、"5M"）。
+ */
+static int64_t parseBitrate(const std::string& bitrateStr)
+{
+    if (bitrateStr.empty())
     {
+        return 0;
+    }
+    char last_char = bitrateStr.back();
+    std::string num_part = bitrateStr;
+    int64_t multiplier = 1;
+
+    if (last_char == 'k' || last_char == 'K')
+    {
+        multiplier = 1000;
+        num_part.pop_back();
+    }
+    else if (last_char == 'm' || last_char == 'M')
+    {
+        multiplier = 1000000;
+        num_part.pop_back();
     }
 
-    RenderEngine::~RenderEngine()
+    try
     {
-        if (m_audioFifo) {
-            av_audio_fifo_free(m_audioFifo);
-        }
-    }
-
-    /**
-     * @brief 初始化渲染上下文。
-     *
-     * 初始化步骤：
-     * 1. 重置内部计数、缓存与预取任务；
-     * 2. 基于场景时长预估总帧数用于进度汇报；
-     * 3. 创建输出容器与视频/音频编码流；
-     * 4. 写入容器头。
-     */
-    bool RenderEngine::initialize(const ProjectConfig &config)
-    {
-        m_config = config;
-        m_frameCount = 0;
-        m_audioSamplesCount = 0;
-        m_progress = 0;
-        m_lastReportedProgress = -1;
-        m_sceneFirstFrames.clear();
-        m_sceneLastFrames.clear();
-        m_mixBufferLeft.clear();
-        m_mixBufferRight.clear();
-        m_reusableMixFrame.reset();
-        m_reusableMixFrameCapacity = 0;
-        scheduleVideoPrefetchTasks();
-
-
-
-        // 计算总帧数用于进度报告（scene.duration 已在 ConfigLoader 中同步到真实时长）
-        double totalDuration = 0;
-        for (const auto &scene : m_config.scenes) {
-            if (scene.duration > 0) {
-                totalDuration += scene.duration;
-            }
-        }
-
-        m_totalProjectFrames = totalDuration * m_config.project.fps;
-
-        if (!createOutputContext()) return false;
-        if (!createVideoStream()) return false;
-        if (!createAudioStream()) {
-             qDebug() << "音频流创建失败，将生成无声视频";
-        }
-
-        int ret = avformat_write_header(m_outputContext.get(), nullptr);
-        if (ret < 0) {
-            m_errorString = format_ffmpeg_error(ret, "写入文件头失败");
-            return false;
-        }
-
-        return true;
-    }
-
-    /**
-     * @brief 执行全项目渲染。
-     *
-     * 主循环按配置顺序遍历 scenes，普通场景走 renderScene，
-     * 转场场景走 renderTransition。结束后统一 flush 音频/视频编码器。
-     */
-    bool RenderEngine::render()
-    {
-        qDebug() << "开始渲染所有场景，总共" << m_config.scenes.size() << "个场景";
-        
-        for (size_t i = 0; i < m_config.scenes.size(); ++i)
+        // Trim whitespace from num_part before conversion
+        size_t first = num_part.find_first_not_of(" \t\n\r");
+        if (std::string::npos == first)
         {
-            const auto &currentScene = m_config.scenes[i];
-            qDebug() << "处理场景" << i << ": ID=" << currentScene.id << ", 类型=" << (currentScene.type == SceneType::TRANSITION ? "转场" : "普通");
-
-            if (currentScene.type == SceneType::TRANSITION)
-            {
-                if (i == 0 || i >= m_config.scenes.size() - 1) {
-                    m_errorString = "转场必须在两个场景之间";
-                    return false;
-                }
-                const auto &fromScene = m_config.scenes[i - 1];
-                const auto &toScene = m_config.scenes[i + 1];
-                if (!renderTransition(currentScene, fromScene, toScene)) return false;
-            }
-            else
-            {
-                if (!renderScene(currentScene)) return false;
-            }
+            std::cerr << "Invalid bitrate value (only whitespace): " << bitrateStr.c_str();
+            return 0;
         }
+        size_t last = num_part.find_last_not_of(" \t\n\r");
+        num_part = num_part.substr(first, (last - first + 1));
 
-        if (m_audioStream) {
-            if (!flushAudio()) return false;
+        return static_cast<int64_t>(std::stoll(num_part) * multiplier);
+    }
+    catch (const std::invalid_argument& e)
+    {
+        std::cerr << "Invalid bitrate value: " << bitrateStr.c_str();
+        return 0;
+    }
+    catch (const std::out_of_range& e)
+    {
+        std::cerr << "Bitrate value out of range: " << bitrateStr.c_str();
+        return 0;
+    }
+}
+
+/**
+ * @brief 构造渲染引擎。
+ */
+RenderEngine::RenderEngine()
+    : m_videoStream(nullptr)
+    , m_audioStream(nullptr)
+    , m_audioFifo(nullptr)
+    , m_frameCount(0)
+    , m_audioSamplesCount(0)
+    , m_progress(0)
+    , m_totalProjectFrames(0)
+    , m_lastReportedProgress(-1)
+    , m_enableAudioTransition(false)
+    , m_reusableMixFrameCapacity(0)
+{
+}
+
+RenderEngine::~RenderEngine()
+{
+    if (m_audioFifo)
+    {
+        av_audio_fifo_free(m_audioFifo);
+    }
+}
+
+/**
+ * @brief 初始化渲染上下文。
+ *
+ * 初始化步骤：
+ * 1. 重置内部计数、缓存与预取任务；
+ * 2. 基于场景时长预估总帧数用于进度汇报；
+ * 3. 创建输出容器与视频/音频编码流；
+ * 4. 写入容器头。
+ */
+bool RenderEngine::initialize(const ProjectConfig& config)
+{
+    m_config = config;
+    m_frameCount = 0;
+    m_audioSamplesCount = 0;
+    m_progress = 0;
+    m_lastReportedProgress = -1;
+    m_sceneFirstFrames.clear();
+    m_sceneLastFrames.clear();
+    m_mixBufferLeft.clear();
+    m_mixBufferRight.clear();
+    m_reusableMixFrame.reset();
+    m_reusableMixFrameCapacity = 0;
+    scheduleVideoPrefetchTasks();
+
+    // 计算总帧数用于进度报告（scene.duration 已在 ConfigLoader 中同步到真实时长）
+    double totalDuration = 0;
+    for (const auto& scene : m_config.scenes)
+    {
+        if (scene.duration > 0)
+        {
+            totalDuration += scene.duration;
         }
-
-        if (!flushEncoder(m_videoCodecContext.get(), m_videoStream)) return false;
-        if (!flushEncoder(m_audioCodecContext.get(), m_audioStream)) return false;
-
-        int ret = av_write_trailer(m_outputContext.get());
-        if (ret < 0) {
-            m_errorString = format_ffmpeg_error(ret, "写入文件尾失败");
-            return false;
-        }
-
-        qDebug() << "视频渲染完成！总帧数: " << m_frameCount;
-
-        if (m_lastReportedProgress < 100) {
-            m_progress = 100;
-            m_lastReportedProgress = m_progress;
-        }
-
-        m_sceneFirstFramePrefetch.clear();
-        return true;
     }
 
-    /**
-     * @brief 创建输出封装上下文并打开目标文件。
-     */
-    bool RenderEngine::createOutputContext()
-    {
-        AVFormatContext* temp_ctx = nullptr;
-        int ret = avformat_alloc_output_context2(&temp_ctx, nullptr, nullptr, m_config.project.output_path.c_str());
-        if (ret < 0) {
-            m_errorString = format_ffmpeg_error(ret, "创建输出上下文失败");
-            return false;
-        }
-        m_outputContext.reset(temp_ctx);
+    m_totalProjectFrames = totalDuration * m_config.project.fps;
 
-        if (!(m_outputContext->oformat->flags & AVFMT_NOFILE)) {
-            ret = avio_open(&m_outputContext->pb, m_config.project.output_path.c_str(), AVIO_FLAG_WRITE);
-            if (ret < 0) {
-                m_errorString = format_ffmpeg_error(ret, "无法打开输出文件");
+    if (!createOutputContext())
+        return false;
+    if (!createVideoStream())
+        return false;
+    if (!createAudioStream())
+    {
+        std::cerr << "音频流创建失败，将生成无声视频";
+    }
+
+    int ret = avformat_write_header(m_outputContext.get(), nullptr);
+    if (ret < 0)
+    {
+        m_errorString = format_ffmpeg_error(ret, "写入文件头失败");
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief 执行全项目渲染。
+ *
+ * 主循环按配置顺序遍历 scenes，普通场景走 renderScene，
+ * 转场场景走 renderTransition。结束后统一 flush 音频/视频编码器。
+ */
+bool RenderEngine::render()
+{
+    std::cerr << "开始渲染所有场景，总共" << m_config.scenes.size() << "个场景";
+
+    for (size_t i = 0; i < m_config.scenes.size(); ++i)
+    {
+        const auto& currentScene = m_config.scenes[i];
+        std::cerr << "处理场景" << i << ": ID=" << currentScene.id
+                  << ", 类型=" << (currentScene.type == SceneType::TRANSITION ? "转场" : "普通");
+
+        if (currentScene.type == SceneType::TRANSITION)
+        {
+            if (i == 0 || i >= m_config.scenes.size() - 1)
+            {
+                m_errorString = "转场必须在两个场景之间";
                 return false;
             }
+            const auto& fromScene = m_config.scenes[i - 1];
+            const auto& toScene = m_config.scenes[i + 1];
+            if (!renderTransition(currentScene, fromScene, toScene))
+                return false;
         }
-        return true;
-    }
-
-    /**
-     * @brief 创建视频编码流。
-     */
-    bool RenderEngine::createVideoStream()
-    {
-        const AVCodec *videoCodec = avcodec_find_encoder_by_name(m_config.global_effects.video_encoding.codec.c_str());
-        if (!videoCodec) {
-            m_errorString = "找不到视频编码器: " + m_config.global_effects.video_encoding.codec;
-            return false;
-        }
-        m_videoStream = avformat_new_stream(m_outputContext.get(), videoCodec);
-        if (!m_videoStream) {
-            m_errorString = "创建视频流失败";
-            return false;
-        }
-        m_videoStream->id = m_outputContext->nb_streams - 1;
-
-        AVCodecContext* temp_ctx = avcodec_alloc_context3(videoCodec);
-        if (!temp_ctx) {
-            m_errorString = "创建视频编码器上下文失败";
-            return false;
-        }
-        m_videoCodecContext.reset(temp_ctx);
-
-        m_videoCodecContext->width = m_config.project.width;
-        m_videoCodecContext->height = m_config.project.height;
-        m_videoCodecContext->time_base = {1, m_config.project.fps};
-        m_videoCodecContext->framerate = {m_config.project.fps, 1};
-        m_videoCodecContext->pix_fmt = AV_PIX_FMT_YUV420P;
-        std::string bitrateStr = m_config.global_effects.video_encoding.bitrate;
-        m_videoCodecContext->bit_rate = parseBitrate(bitrateStr);
-        m_videoCodecContext->gop_size = 12;
-        unsigned int hardwareThreads = std::thread::hardware_concurrency();
-        if (hardwareThreads == 0) {
-            hardwareThreads = 4;
-        }
-        m_videoCodecContext->thread_count = static_cast<int>(std::min(8u, hardwareThreads));
-        m_videoCodecContext->thread_type = FF_THREAD_FRAME;
-
-        av_opt_set(m_videoCodecContext->priv_data, "preset", m_config.global_effects.video_encoding.preset.c_str(), 0);
-        av_opt_set_int(m_videoCodecContext->priv_data, "crf", m_config.global_effects.video_encoding.crf, 0);
-
-        int ret = avcodec_open2(m_videoCodecContext.get(), videoCodec, nullptr);
-        if (ret < 0) {
-            m_errorString = format_ffmpeg_error(ret, "打开视频编码器失败");
-            return false;
-        }
-
-        ret = avcodec_parameters_from_context(m_videoStream->codecpar, m_videoCodecContext.get());
-        if (ret < 0) {
-            m_errorString = format_ffmpeg_error(ret, "复制视频流参数失败");
-            return false;
-        }
-        m_videoStream->time_base = m_videoCodecContext->time_base;
-        return true;
-    }
-
-    /**
-     * @brief 创建音频编码流和 FIFO。
-     */
-    bool RenderEngine::createAudioStream()
-    {
-        const AVCodec *audioCodec = avcodec_find_encoder_by_name(m_config.global_effects.audio_encoding.codec.c_str());
-        if (!audioCodec) {
-            m_errorString = "找不到音频编码器: " + m_config.global_effects.audio_encoding.codec;
-            return false;
-        }
-        m_audioStream = avformat_new_stream(m_outputContext.get(), audioCodec);
-        if (!m_audioStream) {
-            m_errorString = "创建音频流失败";
-            return false;
-        }
-        m_audioStream->id = m_outputContext->nb_streams - 1;
-        
-        AVCodecContext* temp_ctx = avcodec_alloc_context3(audioCodec);
-        if (!temp_ctx) {
-            m_errorString = "创建音频编码器上下文失败";
-            return false;
-        }
-        m_audioCodecContext.reset(temp_ctx);
-
-        m_audioCodecContext->sample_fmt = AV_SAMPLE_FMT_FLTP;
-        std::string bitrateStr = m_config.global_effects.audio_encoding.bitrate;
-        m_audioCodecContext->bit_rate = parseBitrate(bitrateStr);
-        m_audioCodecContext->sample_rate = 44100;
-        av_channel_layout_from_mask(&m_audioCodecContext->ch_layout, AV_CH_LAYOUT_STEREO);
-        m_audioCodecContext->time_base = {1, m_audioCodecContext->sample_rate};
-        unsigned int audioThreads = std::thread::hardware_concurrency();
-        if (audioThreads == 0) {
-            audioThreads = 2;
-        }
-        m_audioCodecContext->thread_count = static_cast<int>(std::min(4u, audioThreads));
-
-        int ret = avcodec_open2(m_audioCodecContext.get(), audioCodec, nullptr);
-        if (ret < 0) {
-            m_errorString = format_ffmpeg_error(ret, "打开音频编码器失败");
-            return false;
-        }
-        ret = avcodec_parameters_from_context(m_audioStream->codecpar, m_audioCodecContext.get());
-        if (ret < 0) {
-            m_errorString = format_ffmpeg_error(ret, "复制音频流参数失败");
-            return false;
-        }
-        m_audioFifo = av_audio_fifo_alloc(m_audioCodecContext->sample_fmt, m_audioCodecContext->ch_layout.nb_channels, 1);
-        if (!m_audioFifo) {
-            m_errorString = "创建音频FIFO缓冲区失败";
-            return false;
-        }
-        m_audioStream->time_base = m_audioCodecContext->time_base;
-        return true;
-    }
-
-    /**
-     * @brief 渲染单个普通场景。
-     *
-     * 实现细节：
-     * 1. 根据场景类型初始化图片/视频解码器；
-     * 2. 启动异步视频取帧线程和多音轨解码线程；
-     * 3. 以时间轴驱动“写视频帧 or 写音频帧”；
-     * 4. 缓存首尾帧，为转场复用；
-     * 5. 将混音结果写入 FIFO 并编码输出。
-     */
-    bool RenderEngine::renderScene(const SceneConfig &scene)
-    {
-        struct SceneAudioLayer
+        else
         {
-            std::unique_ptr<AudioDecoder> decoder;
-            std::deque<float> channels[2];
-            int64_t delaySamples = 0;
-            std::mutex mutex;
-            std::condition_variable cv;
-            std::thread worker;
-            bool finished = false;
-            bool error = false;
-            std::atomic<bool> stopRequested{false};
-            std::string errorMessage;
-        };
+            if (!renderScene(currentScene))
+                return false;
+        }
+    }
 
-        struct AudioLayerThreadGuard
+    if (m_audioStream)
+    {
+        if (!flushAudio())
+            return false;
+    }
+
+    if (!flushEncoder(m_videoCodecContext.get(), m_videoStream))
+        return false;
+    if (!flushEncoder(m_audioCodecContext.get(), m_audioStream))
+        return false;
+
+    int ret = av_write_trailer(m_outputContext.get());
+    if (ret < 0)
+    {
+        m_errorString = format_ffmpeg_error(ret, "写入文件尾失败");
+        return false;
+    }
+
+    std::cerr << "视频渲染完成！总帧数: " << m_frameCount;
+
+    if (m_lastReportedProgress < 100)
+    {
+        m_progress = 100;
+        m_lastReportedProgress = m_progress;
+    }
+
+    m_sceneFirstFramePrefetch.clear();
+    return true;
+}
+
+/**
+ * @brief 创建输出封装上下文并打开目标文件。
+ */
+bool RenderEngine::createOutputContext()
+{
+    AVFormatContext* temp_ctx = nullptr;
+    int ret = avformat_alloc_output_context2(&temp_ctx, nullptr, nullptr, m_config.project.output_path.c_str());
+    if (ret < 0)
+    {
+        m_errorString = format_ffmpeg_error(ret, "创建输出上下文失败");
+        return false;
+    }
+    m_outputContext.reset(temp_ctx);
+
+    if (!(m_outputContext->oformat->flags & AVFMT_NOFILE))
+    {
+        ret = avio_open(&m_outputContext->pb, m_config.project.output_path.c_str(), AVIO_FLAG_WRITE);
+        if (ret < 0)
         {
-            explicit AudioLayerThreadGuard(std::vector<std::unique_ptr<SceneAudioLayer>> &layerRefs)
-                : layers(layerRefs){}
+            m_errorString = format_ffmpeg_error(ret, "无法打开输出文件");
+            return false;
+        }
+    }
+    return true;
+}
 
-            std::vector<std::unique_ptr<SceneAudioLayer>> &layers;
-            ~AudioLayerThreadGuard()
+/**
+ * @brief 创建视频编码流。
+ */
+bool RenderEngine::createVideoStream()
+{
+    const AVCodec* videoCodec = avcodec_find_encoder_by_name(m_config.global_effects.video_encoding.codec.c_str());
+    if (!videoCodec)
+    {
+        m_errorString = "找不到视频编码器: " + m_config.global_effects.video_encoding.codec;
+        return false;
+    }
+    m_videoStream = avformat_new_stream(m_outputContext.get(), videoCodec);
+    if (!m_videoStream)
+    {
+        m_errorString = "创建视频流失败";
+        return false;
+    }
+    m_videoStream->id = m_outputContext->nb_streams - 1;
+
+    AVCodecContext* temp_ctx = avcodec_alloc_context3(videoCodec);
+    if (!temp_ctx)
+    {
+        m_errorString = "创建视频编码器上下文失败";
+        return false;
+    }
+    m_videoCodecContext.reset(temp_ctx);
+
+    m_videoCodecContext->width = m_config.project.width;
+    m_videoCodecContext->height = m_config.project.height;
+    m_videoCodecContext->time_base = {1, m_config.project.fps};
+    m_videoCodecContext->framerate = {m_config.project.fps, 1};
+    m_videoCodecContext->pix_fmt = AV_PIX_FMT_YUV420P;
+    std::string bitrateStr = m_config.global_effects.video_encoding.bitrate;
+    m_videoCodecContext->bit_rate = parseBitrate(bitrateStr);
+    m_videoCodecContext->gop_size = 12;
+    unsigned int hardwareThreads = std::thread::hardware_concurrency();
+    if (hardwareThreads == 0)
+    {
+        hardwareThreads = 4;
+    }
+    m_videoCodecContext->thread_count = static_cast<int>(std::min(8u, hardwareThreads));
+    m_videoCodecContext->thread_type = FF_THREAD_FRAME;
+
+    av_opt_set(m_videoCodecContext->priv_data, "preset", m_config.global_effects.video_encoding.preset.c_str(), 0);
+    av_opt_set_int(m_videoCodecContext->priv_data, "crf", m_config.global_effects.video_encoding.crf, 0);
+
+    int ret = avcodec_open2(m_videoCodecContext.get(), videoCodec, nullptr);
+    if (ret < 0)
+    {
+        m_errorString = format_ffmpeg_error(ret, "打开视频编码器失败");
+        return false;
+    }
+
+    ret = avcodec_parameters_from_context(m_videoStream->codecpar, m_videoCodecContext.get());
+    if (ret < 0)
+    {
+        m_errorString = format_ffmpeg_error(ret, "复制视频流参数失败");
+        return false;
+    }
+    m_videoStream->time_base = m_videoCodecContext->time_base;
+    return true;
+}
+
+/**
+ * @brief 创建音频编码流和 FIFO。
+ */
+bool RenderEngine::createAudioStream()
+{
+    const AVCodec* audioCodec = avcodec_find_encoder_by_name(m_config.global_effects.audio_encoding.codec.c_str());
+    if (!audioCodec)
+    {
+        m_errorString = "找不到音频编码器: " + m_config.global_effects.audio_encoding.codec;
+        return false;
+    }
+    m_audioStream = avformat_new_stream(m_outputContext.get(), audioCodec);
+    if (!m_audioStream)
+    {
+        m_errorString = "创建音频流失败";
+        return false;
+    }
+    m_audioStream->id = m_outputContext->nb_streams - 1;
+
+    AVCodecContext* temp_ctx = avcodec_alloc_context3(audioCodec);
+    if (!temp_ctx)
+    {
+        m_errorString = "创建音频编码器上下文失败";
+        return false;
+    }
+    m_audioCodecContext.reset(temp_ctx);
+
+    m_audioCodecContext->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    std::string bitrateStr = m_config.global_effects.audio_encoding.bitrate;
+    m_audioCodecContext->bit_rate = parseBitrate(bitrateStr);
+    m_audioCodecContext->sample_rate = 44100;
+    av_channel_layout_from_mask(&m_audioCodecContext->ch_layout, AV_CH_LAYOUT_STEREO);
+    m_audioCodecContext->time_base = {1, m_audioCodecContext->sample_rate};
+    unsigned int audioThreads = std::thread::hardware_concurrency();
+    if (audioThreads == 0)
+    {
+        audioThreads = 2;
+    }
+    m_audioCodecContext->thread_count = static_cast<int>(std::min(4u, audioThreads));
+
+    int ret = avcodec_open2(m_audioCodecContext.get(), audioCodec, nullptr);
+    if (ret < 0)
+    {
+        m_errorString = format_ffmpeg_error(ret, "打开音频编码器失败");
+        return false;
+    }
+    ret = avcodec_parameters_from_context(m_audioStream->codecpar, m_audioCodecContext.get());
+    if (ret < 0)
+    {
+        m_errorString = format_ffmpeg_error(ret, "复制音频流参数失败");
+        return false;
+    }
+    m_audioFifo = av_audio_fifo_alloc(m_audioCodecContext->sample_fmt, m_audioCodecContext->ch_layout.nb_channels, 1);
+    if (!m_audioFifo)
+    {
+        m_errorString = "创建音频FIFO缓冲区失败";
+        return false;
+    }
+    m_audioStream->time_base = m_audioCodecContext->time_base;
+    return true;
+}
+
+/**
+ * @brief 渲染单个普通场景。
+ *
+ * 实现细节：
+ * 1. 根据场景类型初始化图片/视频解码器；
+ * 2. 启动异步视频取帧线程和多音轨解码线程；
+ * 3. 以时间轴驱动“写视频帧 or 写音频帧”；
+ * 4. 缓存首尾帧，为转场复用；
+ * 5. 将混音结果写入 FIFO 并编码输出。
+ */
+bool RenderEngine::renderScene(const SceneConfig& scene)
+{
+    struct SceneAudioLayer
+    {
+        std::unique_ptr<AudioDecoder> decoder;
+        std::deque<float> channels[2];
+        int64_t delaySamples = 0;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::thread worker;
+        bool finished = false;
+        bool error = false;
+        std::atomic<bool> stopRequested{false};
+        std::string errorMessage;
+    };
+
+    struct AudioLayerThreadGuard
+    {
+        explicit AudioLayerThreadGuard(std::vector<std::unique_ptr<SceneAudioLayer>>& layerRefs)
+            : layers(layerRefs)
+        {
+        }
+
+        std::vector<std::unique_ptr<SceneAudioLayer>>& layers;
+        ~AudioLayerThreadGuard()
+        {
+            stop();
+        }
+        void stop()
+        {
+            for (auto& layerPtr : layers)
             {
-                stop();
-            }
-            void stop()
-            {
-                for (auto &layerPtr : layers)
+                if (!layerPtr)
                 {
-                    if (!layerPtr)
-                    {
-                        continue;
-                    }
-                    auto &layer = *layerPtr;
-                    {
-                        std::lock_guard<std::mutex> lock(layer.mutex);
-                        layer.stopRequested.store(true);
-                    }
-                    layer.cv.notify_all();
-                    if (layer.worker.joinable())
-                    {
-                        layer.worker.join();
-                    }
+                    continue;
                 }
-            }
-        };
-
-        struct AsyncFrameQueue
-        {
-            std::mutex mutex;
-            std::condition_variable cv;
-            std::deque<FFmpegUtils::AvFramePtr> frames;
-            bool finished = false;
-            bool error = false;
-            std::atomic<bool> stopRequested{false};
-            std::string errorMessage;
-        };
-
-        struct FrameThreadGuard
-        {
-            AsyncFrameQueue &queue;
-            std::thread worker;
-            FrameThreadGuard(AsyncFrameQueue &q) : queue(q) {}
-            ~FrameThreadGuard()
-            {
-                stop();
-            }
-            void stop()
-            {
-                if (worker.joinable())
+                auto& layer = *layerPtr;
                 {
-                    {
-                        std::lock_guard<std::mutex> lock(queue.mutex);
-                        queue.stopRequested.store(true);
-                    }
-                    queue.cv.notify_all();
-                    worker.join();
+                    std::lock_guard<std::mutex> lock(layer.mutex);
+                    layer.stopRequested.store(true);
+                }
+                layer.cv.notify_all();
+                if (layer.worker.joinable())
+                {
+                    layer.worker.join();
                 }
             }
-        };
-
-        const bool isVideoScene = scene.type == SceneType::VIDEO_SCENE;
-        if (isVideoScene) {
-            // 预取结果按需落地到缓存，避免主线程阻塞解码首帧。
-            resolveScenePrefetch(scene);
         }
+    };
 
-        ImageDecoder imageDecoder;
-        if (!isVideoScene && !scene.resources.image.path.empty() && !imageDecoder.open(scene.resources.image.path)) {
-             qDebug() << "无法打开图片: " << imageDecoder.getErrorString();
-        }
+    struct AsyncFrameQueue
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<FFmpegUtils::AvFramePtr> frames;
+        bool finished = false;
+        bool error = false;
+        std::atomic<bool> stopRequested{false};
+        std::string errorMessage;
+    };
 
-        VideoDecoder videoDecoder;
-        bool videoSourceAvailable = false;
-        if (isVideoScene) {
-            if (scene.resources.video.path.empty()) {
-                m_errorString = "视频场景缺少视频文件路径";
-                return false;
-            }
-            if (!videoDecoder.open(scene.resources.video.path)) {
-                m_errorString = "无法打开视频: " + videoDecoder.getErrorString();
-                return false;
-            }
-            videoSourceAvailable = true;
-        }
-
-        double sceneDuration = scene.duration;
-        if (isVideoScene && videoSourceAvailable)
+    struct FrameThreadGuard
+    {
+        AsyncFrameQueue& queue;
+        std::thread worker;
+        FrameThreadGuard(AsyncFrameQueue& q)
+            : queue(q)
         {
-            double videoDuration = videoDecoder.getDuration();
-            if (videoDuration > 0)
+        }
+        ~FrameThreadGuard()
+        {
+            stop();
+        }
+        void stop()
+        {
+            if (worker.joinable())
             {
-                sceneDuration = videoDuration;
-                qDebug() << "Scene duration synced to video length:" << sceneDuration << "s";
+                {
+                    std::lock_guard<std::mutex> lock(queue.mutex);
+                    queue.stopRequested.store(true);
+                }
+                queue.cv.notify_all();
+                worker.join();
             }
         }
+    };
 
-        std::vector<std::unique_ptr<SceneAudioLayer>> sceneAudioLayers;
-        AudioLayerThreadGuard audioLayerGuard(sceneAudioLayers);
-        double longestAudioDuration = -1.0;
+    const bool isVideoScene = scene.type == SceneType::VIDEO_SCENE;
+    if (isVideoScene)
+    {
+        // 预取结果按需落地到缓存，避免主线程阻塞解码首帧。
+        resolveScenePrefetch(scene);
+    }
 
-        AsyncFrameQueue videoFrameQueue;
-        FrameThreadGuard videoThreadGuard(videoFrameQueue);
-        if (isVideoScene && videoSourceAvailable)
+    ImageDecoder imageDecoder;
+    if (!isVideoScene && !scene.resources.image.path.empty() && !imageDecoder.open(scene.resources.image.path))
+    {
+        std::cerr << "无法打开图片: " << imageDecoder.getErrorString();
+    }
+
+    VideoDecoder videoDecoder;
+    bool videoSourceAvailable = false;
+    if (isVideoScene)
+    {
+        if (scene.resources.video.path.empty())
         {
-            const size_t maxVideoQueueSize = 8;
-            // 异步视频线程：持续解码并缩放后塞入有界队列，主线程按需消费。
-            videoThreadGuard.worker = std::thread([&, maxVideoQueueSize]() {
+            m_errorString = "视频场景缺少视频文件路径";
+            return false;
+        }
+        if (!videoDecoder.open(scene.resources.video.path))
+        {
+            m_errorString = "无法打开视频: " + videoDecoder.getErrorString();
+            return false;
+        }
+        videoSourceAvailable = true;
+    }
+
+    double sceneDuration = scene.duration;
+    if (isVideoScene && videoSourceAvailable)
+    {
+        double videoDuration = videoDecoder.getDuration();
+        if (videoDuration > 0)
+        {
+            sceneDuration = videoDuration;
+            std::cerr << "Scene duration synced to video length:" << sceneDuration << "s";
+        }
+    }
+
+    std::vector<std::unique_ptr<SceneAudioLayer>> sceneAudioLayers;
+    AudioLayerThreadGuard audioLayerGuard(sceneAudioLayers);
+    double longestAudioDuration = -1.0;
+
+    AsyncFrameQueue videoFrameQueue;
+    FrameThreadGuard videoThreadGuard(videoFrameQueue);
+    if (isVideoScene && videoSourceAvailable)
+    {
+        const size_t maxVideoQueueSize = 8;
+        // 异步视频线程：持续解码并缩放后塞入有界队列，主线程按需消费。
+        videoThreadGuard.worker = std::thread(
+            [&, maxVideoQueueSize]()
+            {
                 while (true)
                 {
                     if (videoFrameQueue.stopRequested.load())
@@ -488,19 +549,24 @@ namespace VideoCreator
                     int decodeResult = videoDecoder.decodeFrame(decodedFrame);
                     if (decodeResult > 0 && decodedFrame)
                     {
-                        auto scaledFrame = videoDecoder.scaleFrame(decodedFrame.get(), m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
+                        auto scaledFrame = videoDecoder.scaleFrame(
+                            decodedFrame.get(), m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
                         if (!scaledFrame)
                         {
                             std::lock_guard<std::mutex> lock(videoFrameQueue.mutex);
                             videoFrameQueue.error = true;
-                            videoFrameQueue.errorMessage = "Failed to scale video frame: " + videoDecoder.getErrorString();
+                            videoFrameQueue.errorMessage =
+                                "Failed to scale video frame: " + videoDecoder.getErrorString();
                             videoFrameQueue.cv.notify_all();
                             break;
                         }
                         std::unique_lock<std::mutex> lock(videoFrameQueue.mutex);
-                        videoFrameQueue.cv.wait(lock, [&]() {
-                            return videoFrameQueue.stopRequested.load() || videoFrameQueue.frames.size() < maxVideoQueueSize;
-                        });
+                        videoFrameQueue.cv.wait(lock,
+                            [&]()
+                            {
+                                return videoFrameQueue.stopRequested.load() ||
+                                       videoFrameQueue.frames.size() < maxVideoQueueSize;
+                            });
                         if (videoFrameQueue.stopRequested.load())
                         {
                             break;
@@ -526,1181 +592,1469 @@ namespace VideoCreator
                     }
                 }
             });
-        }
+    }
 
-        if (m_audioStream) {
-            const int targetSampleRate = (m_audioCodecContext && m_audioCodecContext->sample_rate > 0) ? m_audioCodecContext->sample_rate : 44100;
-            const size_t maxBufferedSamples = static_cast<size_t>(targetSampleRate) * 5;
-            size_t expectedLayers = 0;
-            if (!scene.resources.audio.path.empty()) {
-                expectedLayers++;
-            }
-            expectedLayers += scene.resources.audio_layers.size();
-            if (isVideoScene && scene.resources.video.use_audio && !scene.resources.video.path.empty()) {
-                expectedLayers++;
-            }
-            if (expectedLayers > 0) {
-                sceneAudioLayers.reserve(expectedLayers);
-            }
-            std::vector<AudioConfig> transientAudioConfigs;
-            auto startAudioLayerWorker = [&](SceneAudioLayer &layerRef) {
-                SceneAudioLayer *layerPtr = &layerRef;
-                // 每个音轨独立线程解码，输出 float 双声道采样到环形队列。
-                layerRef.worker = std::thread([layerPtr, maxBufferedSamples]() {
-                    while (true) {
+    if (m_audioStream)
+    {
+        const int targetSampleRate =
+            (m_audioCodecContext && m_audioCodecContext->sample_rate > 0) ? m_audioCodecContext->sample_rate : 44100;
+        const size_t maxBufferedSamples = static_cast<size_t>(targetSampleRate) * 5;
+        size_t expectedLayers = 0;
+        if (!scene.resources.audio.path.empty())
+        {
+            expectedLayers++;
+        }
+        expectedLayers += scene.resources.audio_layers.size();
+        if (isVideoScene && scene.resources.video.use_audio && !scene.resources.video.path.empty())
+        {
+            expectedLayers++;
+        }
+        if (expectedLayers > 0)
+        {
+            sceneAudioLayers.reserve(expectedLayers);
+        }
+        std::vector<AudioConfig> transientAudioConfigs;
+        auto startAudioLayerWorker = [&](SceneAudioLayer& layerRef)
+        {
+            SceneAudioLayer* layerPtr = &layerRef;
+            // 每个音轨独立线程解码，输出 float 双声道采样到环形队列。
+            layerRef.worker = std::thread(
+                [layerPtr, maxBufferedSamples]()
+                {
+                    while (true)
+                    {
                         {
                             std::lock_guard<std::mutex> lock(layerPtr->mutex);
-                            if (layerPtr->stopRequested.load()) {
+                            if (layerPtr->stopRequested.load())
+                            {
                                 break;
                             }
                         }
                         FFmpegUtils::AvFramePtr frame;
                         int decodeResult = layerPtr->decoder->decodeFrame(frame);
-                        if (decodeResult > 0 && frame) {
+                        if (decodeResult > 0 && frame)
+                        {
                             int channelCount = frame->ch_layout.nb_channels > 0 ? frame->ch_layout.nb_channels : 1;
                             channelCount = std::min(channelCount, 2);
                             std::unique_lock<std::mutex> lock(layerPtr->mutex);
-                            layerPtr->cv.wait(lock, [&]() {
-                                return layerPtr->stopRequested.load() || layerPtr->channels[0].size() < maxBufferedSamples;
-                            });
-                            if (layerPtr->stopRequested.load()) {
+                            layerPtr->cv.wait(lock,
+                                [&]()
+                                {
+                                    return layerPtr->stopRequested.load() ||
+                                           layerPtr->channels[0].size() < maxBufferedSamples;
+                                });
+                            if (layerPtr->stopRequested.load())
+                            {
                                 break;
                             }
-                            for (int ch = 0; ch < channelCount; ++ch) {
-                                float *data = reinterpret_cast<float *>(frame->data[ch]);
-                                layerPtr->channels[ch].insert(layerPtr->channels[ch].end(), data, data + frame->nb_samples);
+                            for (int ch = 0; ch < channelCount; ++ch)
+                            {
+                                float* data = reinterpret_cast<float*>(frame->data[ch]);
+                                layerPtr->channels[ch].insert(
+                                    layerPtr->channels[ch].end(), data, data + frame->nb_samples);
                             }
-                            if (channelCount == 1) {
+                            if (channelCount == 1)
+                            {
                                 auto copyBegin = layerPtr->channels[0].end() - frame->nb_samples;
-                                layerPtr->channels[1].insert(layerPtr->channels[1].end(), copyBegin, layerPtr->channels[0].end());
+                                layerPtr->channels[1].insert(
+                                    layerPtr->channels[1].end(), copyBegin, layerPtr->channels[0].end());
                             }
                             size_t maxSamples = std::max(layerPtr->channels[0].size(), layerPtr->channels[1].size());
                             layerPtr->channels[0].resize(maxSamples, 0.0f);
                             layerPtr->channels[1].resize(maxSamples, 0.0f);
                             lock.unlock();
                             layerPtr->cv.notify_all();
-                        } else if (decodeResult == 0) {
+                        }
+                        else if (decodeResult == 0)
+                        {
                             std::lock_guard<std::mutex> lock(layerPtr->mutex);
                             layerPtr->finished = true;
                             layerPtr->cv.notify_all();
                             break;
-                        } else {
+                        }
+                        else
+                        {
                             std::lock_guard<std::mutex> lock(layerPtr->mutex);
                             layerPtr->error = true;
-                            layerPtr->errorMessage = layerPtr->decoder ? layerPtr->decoder->getErrorString() : std::string("Audio decode failed");
+                            layerPtr->errorMessage = layerPtr->decoder ? layerPtr->decoder->getErrorString()
+                                                                       : std::string("Audio decode failed");
                             layerPtr->cv.notify_all();
                             break;
                         }
                     }
                 });
-            };
+        };
 
-            auto addAudioLayer = [&](const AudioConfig &audioConfig, bool applySceneEffect, bool isCritical) {
-                if (audioConfig.path.empty()) {
-                    return true;
-                }
-
-                auto decoder = std::make_unique<AudioDecoder>();
-                if (!decoder->open(audioConfig.path)) {
-                    qDebug() << "Failed to open audio:" << audioConfig.path.c_str() << "reason:" << decoder->getErrorString().c_str();
-                    return !isCritical;
-                }
-
-                bool effectOk = false;
-                if (applySceneEffect) {
-                    effectOk = decoder->applyVolumeEffect(scene);
-                } else {
-                    effectOk = decoder->applyVolumeEffect(audioConfig.volume, nullptr, sceneDuration);
-                }
-
-                if (!effectOk) {
-                    qDebug() << "Volume effect failed:" << decoder->getErrorString().c_str();
-                    return !isCritical;
-                }
-
-                double decoderDuration = decoder->getDuration();
-                if (decoderDuration > longestAudioDuration) {
-                    longestAudioDuration = decoderDuration;
-                }
-
-                auto layer = std::make_unique<SceneAudioLayer>();
-                layer->decoder = std::move(decoder);
-                if (audioConfig.start_offset > 0) {
-                    layer->delaySamples = static_cast<int64_t>(std::round(audioConfig.start_offset * targetSampleRate));
-                }
-                SceneAudioLayer &layerRef = *layer;
-                sceneAudioLayers.emplace_back(std::move(layer));
-                startAudioLayerWorker(layerRef);
-                return true;
-            };
-
-            if (!scene.resources.audio.path.empty()) {
-                if (!addAudioLayer(scene.resources.audio, true, true)) {
-                    m_errorString = "Failed to initialize primary audio source";
-                    return false;
-                }
-            }
-
-            for (const auto &layerConfig : scene.resources.audio_layers) {
-                addAudioLayer(layerConfig, false, false);
-            }
-
-            if (isVideoScene && scene.resources.video.use_audio && !scene.resources.video.path.empty()) {
-                transientAudioConfigs.push_back(AudioConfig{});
-                auto &videoAudioConfig = transientAudioConfigs.back();
-                videoAudioConfig.path = scene.resources.video.path;
-                videoAudioConfig.volume = 1.0;
-                videoAudioConfig.start_offset = 0.0;
-                bool treatAsPrimary = scene.resources.audio.path.empty() && scene.resources.audio_layers.empty();
-                if (!addAudioLayer(videoAudioConfig, treatAsPrimary, treatAsPrimary) && treatAsPrimary) {
-                    m_errorString = "Failed to initialize video audio";
-                    return false;
-                }
-            }
-        }
-
-        auto enqueueSilenceFrame = [&](int requiredSamples) -> bool {
-            if (!m_audioStream || requiredSamples <= 0) {
+        auto addAudioLayer = [&](const AudioConfig& audioConfig, bool applySceneEffect, bool isCritical)
+        {
+            if (audioConfig.path.empty())
+            {
                 return true;
             }
-            if (!ensureReusableAudioFrame(requiredSamples)) {
-                return false;
+
+            auto decoder = std::make_unique<AudioDecoder>();
+            if (!decoder->open(audioConfig.path))
+            {
+                std::cerr << "Failed to open audio:" << audioConfig.path.c_str()
+                          << "reason:" << decoder->getErrorString().c_str();
+                return !isCritical;
             }
-            AVFrame *audioFrame = m_reusableMixFrame.get();
-            av_samples_set_silence(audioFrame->data, 0, audioFrame->nb_samples, audioFrame->ch_layout.nb_channels, (AVSampleFormat)audioFrame->format);
-            if (av_audio_fifo_write(m_audioFifo, (void **)audioFrame->data, audioFrame->nb_samples) < audioFrame->nb_samples) {
-                m_errorString = "Failed to enqueue silence frame into FIFO";
-                return false;
+
+            bool effectOk = false;
+            if (applySceneEffect)
+            {
+                effectOk = decoder->applyVolumeEffect(scene);
             }
+            else
+            {
+                effectOk = decoder->applyVolumeEffect(audioConfig.volume, nullptr, sceneDuration);
+            }
+
+            if (!effectOk)
+            {
+                std::cerr << "Volume effect failed:" << decoder->getErrorString().c_str();
+                return !isCritical;
+            }
+
+            double decoderDuration = decoder->getDuration();
+            if (decoderDuration > longestAudioDuration)
+            {
+                longestAudioDuration = decoderDuration;
+            }
+
+            auto layer = std::make_unique<SceneAudioLayer>();
+            layer->decoder = std::move(decoder);
+            if (audioConfig.start_offset > 0)
+            {
+                layer->delaySamples = static_cast<int64_t>(std::round(audioConfig.start_offset * targetSampleRate));
+            }
+            SceneAudioLayer& layerRef = *layer;
+            sceneAudioLayers.emplace_back(std::move(layer));
+            startAudioLayerWorker(layerRef);
             return true;
         };
 
-        auto mixSceneAudio = [&](int samplesNeeded) -> bool {
-            if (!m_audioStream || samplesNeeded <= 0) {
-                return true;
+        if (!scene.resources.audio.path.empty())
+        {
+            if (!addAudioLayer(scene.resources.audio, true, true))
+            {
+                m_errorString = "Failed to initialize primary audio source";
+                return false;
             }
-            if (sceneAudioLayers.empty()) {
-                return enqueueSilenceFrame(samplesNeeded);
+        }
+
+        for (const auto& layerConfig : scene.resources.audio_layers)
+        {
+            addAudioLayer(layerConfig, false, false);
+        }
+
+        if (isVideoScene && scene.resources.video.use_audio && !scene.resources.video.path.empty())
+        {
+            transientAudioConfigs.push_back(AudioConfig{});
+            auto& videoAudioConfig = transientAudioConfigs.back();
+            videoAudioConfig.path = scene.resources.video.path;
+            videoAudioConfig.volume = 1.0;
+            videoAudioConfig.start_offset = 0.0;
+            bool treatAsPrimary = scene.resources.audio.path.empty() && scene.resources.audio_layers.empty();
+            if (!addAudioLayer(videoAudioConfig, treatAsPrimary, treatAsPrimary) && treatAsPrimary)
+            {
+                m_errorString = "Failed to initialize video audio";
+                return false;
             }
+        }
+    }
 
-            m_mixBufferLeft.assign(samplesNeeded, 0.0f);
-            m_mixBufferRight.assign(samplesNeeded, 0.0f);
-            bool hasActiveLayer = false;
-            bool hasPendingAudio = false;
+    auto enqueueSilenceFrame = [&](int requiredSamples) -> bool
+    {
+        if (!m_audioStream || requiredSamples <= 0)
+        {
+            return true;
+        }
+        if (!ensureReusableAudioFrame(requiredSamples))
+        {
+            return false;
+        }
+        AVFrame* audioFrame = m_reusableMixFrame.get();
+        av_samples_set_silence(audioFrame->data,
+            0,
+            audioFrame->nb_samples,
+            audioFrame->ch_layout.nb_channels,
+            (AVSampleFormat)audioFrame->format);
+        if (av_audio_fifo_write(m_audioFifo, (void**)audioFrame->data, audioFrame->nb_samples) < audioFrame->nb_samples)
+        {
+            m_errorString = "Failed to enqueue silence frame into FIFO";
+            return false;
+        }
+        return true;
+    };
 
-            for (auto &layerPtr : sceneAudioLayers) {
-                if (!layerPtr) {
-                    continue;
-                }
-                auto &layer = *layerPtr;
-                if (layer.delaySamples >= samplesNeeded) {
-                    layer.delaySamples -= samplesNeeded;
-                    if (!layer.finished) {
-                        hasPendingAudio = true;
-                    }
-                    continue;
-                }
+    auto mixSceneAudio = [&](int samplesNeeded) -> bool
+    {
+        if (!m_audioStream || samplesNeeded <= 0)
+        {
+            return true;
+        }
+        if (sceneAudioLayers.empty())
+        {
+            return enqueueSilenceFrame(samplesNeeded);
+        }
 
-                int silentSamples = 0;
-                if (layer.delaySamples > 0) {
-                    silentSamples = static_cast<int>(layer.delaySamples);
-                    layer.delaySamples = 0;
-                }
+        m_mixBufferLeft.assign(samplesNeeded, 0.0f);
+        m_mixBufferRight.assign(samplesNeeded, 0.0f);
+        bool hasActiveLayer = false;
+        bool hasPendingAudio = false;
 
-                const int requiredSamples = samplesNeeded - silentSamples;
-                int consumed = 0;
-                while (consumed < requiredSamples) {
-                    std::unique_lock<std::mutex> lock(layer.mutex);
-                    layer.cv.wait(lock, [&]() {
-                        return layer.stopRequested.load() || layer.error || !layer.channels[0].empty() || layer.finished;
-                    });
-                    if (layer.error) {
-                        std::string errorCopy = layer.errorMessage;
-                        lock.unlock();
-                        m_errorString = errorCopy.empty() ? std::string("Audio decode failed") : errorCopy;
-                        return false;
-                    }
-                    if (layer.channels[0].empty()) {
-                        if (layer.finished || layer.stopRequested.load()) {
-                            lock.unlock();
-                            break;
-                        }
-                        lock.unlock();
-                        continue;
-                    }
-
-                    int available = static_cast<int>(layer.channels[0].size());
-                    int take = std::min(requiredSamples - consumed, available);
-                    if (take > 0) {
-                        hasActiveLayer = true;
-                        for (int i = 0; i < take; ++i) {
-                            const int dstIndex = silentSamples + consumed + i;
-                            m_mixBufferLeft[dstIndex] += layer.channels[0].front();
-                            layer.channels[0].pop_front();
-                            m_mixBufferRight[dstIndex] += layer.channels[1].front();
-                            layer.channels[1].pop_front();
-                        }
-                        consumed += take;
-                        bool bufferHasData = !layer.channels[0].empty() || !layer.channels[1].empty();
-                        if (bufferHasData || !layer.finished) {
-                            hasPendingAudio = true;
-                        }
-                    }
-                    lock.unlock();
-                    layer.cv.notify_all();
-                }
-
-                if (!layer.finished) {
+        for (auto& layerPtr : sceneAudioLayers)
+        {
+            if (!layerPtr)
+            {
+                continue;
+            }
+            auto& layer = *layerPtr;
+            if (layer.delaySamples >= samplesNeeded)
+            {
+                layer.delaySamples -= samplesNeeded;
+                if (!layer.finished)
+                {
                     hasPendingAudio = true;
                 }
+                continue;
             }
 
-            if (!hasActiveLayer && !hasPendingAudio) {
-                // 所有音轨都结束后，补静音保持音视频时间轴连续。
-                return enqueueSilenceFrame(samplesNeeded);
+            int silentSamples = 0;
+            if (layer.delaySamples > 0)
+            {
+                silentSamples = static_cast<int>(layer.delaySamples);
+                layer.delaySamples = 0;
             }
 
-            if (!ensureReusableAudioFrame(samplesNeeded)) {
-                return false;
-            }
-
-            AVFrame *mixedFrame = m_reusableMixFrame.get();
-            const int outputChannels = m_audioCodecContext->ch_layout.nb_channels > 0 ? m_audioCodecContext->ch_layout.nb_channels : 2;
-            for (int ch = 0; ch < outputChannels && ch < 2; ++ch) {
-                float *dst = reinterpret_cast<float *>(mixedFrame->data[ch]);
-                const auto &source = (ch == 0) ? m_mixBufferLeft : m_mixBufferRight;
-                for (int i = 0; i < samplesNeeded; ++i) {
-                    float value = source[i];
-                    value = clamp_value(value, -1.0f, 1.0f);
-                    dst[i] = value;
+            const int requiredSamples = samplesNeeded - silentSamples;
+            int consumed = 0;
+            while (consumed < requiredSamples)
+            {
+                std::unique_lock<std::mutex> lock(layer.mutex);
+                layer.cv.wait(lock,
+                    [&]()
+                    {
+                        return layer.stopRequested.load() || layer.error || !layer.channels[0].empty() ||
+                               layer.finished;
+                    });
+                if (layer.error)
+                {
+                    std::string errorCopy = layer.errorMessage;
+                    lock.unlock();
+                    m_errorString = errorCopy.empty() ? std::string("Audio decode failed") : errorCopy;
+                    return false;
                 }
-            }
-
-            if (av_audio_fifo_write(m_audioFifo, (void **)mixedFrame->data, mixedFrame->nb_samples) < mixedFrame->nb_samples) {
-                m_errorString = "Failed to write mixed audio to FIFO";
-                return false;
-            }
-            return true;
-        };
-
-        if ((!isVideoScene || !videoSourceAvailable || sceneDuration <= 0) && !sceneAudioLayers.empty() && longestAudioDuration > 0)
-        {
-            sceneDuration = longestAudioDuration;
-            qDebug() << "Scene duration synced to audio length:" << sceneDuration << "s";
-        }
-
-
-        int totalVideoFramesInScene = static_cast<int>(std::round(sceneDuration * m_config.project.fps));
-        if (totalVideoFramesInScene <= 0) {
-            qDebug() << "场景 " << scene.id << " 时长为0，跳过渲染。";
-            return true;
-        }
-
-        EffectProcessor effectProcessor;
-        effectProcessor.initialize(m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P, m_config.project.fps);
-        
-        FFmpegUtils::AvFramePtr sourceImageFrame;
-        if (!isVideoScene && imageDecoder.getWidth() > 0) {
-            sourceImageFrame = imageDecoder.decodeAndCache();
-             if (sourceImageFrame) {
-                auto scaledFrame = imageDecoder.scaleToSize(sourceImageFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
-                sourceImageFrame = scaledFrame ? std::move(scaledFrame) : std::move(sourceImageFrame);
-            }
-        }
-        if (!isVideoScene && !sourceImageFrame) {
-             sourceImageFrame = generateTestFrame(m_frameCount, m_config.project.width, m_config.project.height);
-        }
-
-        bool kenBurnsActive = false;
-        if (!isVideoScene && scene.effects.ken_burns.enabled) {
-            if (!effectProcessor.startKenBurnsSequence(scene.effects.ken_burns, sourceImageFrame.get(), totalVideoFramesInScene)) {
-                m_errorString = "处理Ken Burns特效序列失败: " + effectProcessor.getErrorString();
-                return false;
-            }
-            kenBurnsActive = true;
-        }
-    
-        int startFrameCount = m_frameCount;
-        bool videoEOF = false;
-        FFmpegUtils::AvFramePtr lastFrameCopy;
-
-        // 主渲染循环：按“谁时间戳更落后就先推进谁”的策略交织写入音视频。
-        while (m_frameCount < startFrameCount + totalVideoFramesInScene)
-        {
-            double video_time = (double)m_frameCount / m_config.project.fps;
-            double audio_time = m_audioStream ? (double)m_audioSamplesCount / m_audioCodecContext->sample_rate : video_time + 1.0; 
-
-            if (video_time <= audio_time) {
-                // --- VIDEO PART ---
-                FFmpegUtils::AvFramePtr videoFrame;
-
-                if (isVideoScene) {
-                    if (videoEOF) {
+                if (layer.channels[0].empty())
+                {
+                    if (layer.finished || layer.stopRequested.load())
+                    {
+                        lock.unlock();
                         break;
                     }
-                    std::unique_lock<std::mutex> lock(videoFrameQueue.mutex);
-                    videoFrameQueue.cv.wait(lock, [&]() {
-                        return videoFrameQueue.stopRequested.load() || videoFrameQueue.error || !videoFrameQueue.frames.empty() || videoFrameQueue.finished;
-                    });
-                    if (videoFrameQueue.error) {
-                        std::string errorCopy = videoFrameQueue.errorMessage;
-                        lock.unlock();
-                        m_errorString = errorCopy.empty() ? std::string("Video frame prefetch failed") : errorCopy;
-                        return false;
-                    }
-                    if (videoFrameQueue.frames.empty()) {
-                        if (videoFrameQueue.finished || videoFrameQueue.stopRequested.load()) {
-                            videoEOF = true;
-                            lock.unlock();
-                            break;
-                        }
-                        lock.unlock();
-                        continue;
-                    }
-                    videoFrame = std::move(videoFrameQueue.frames.front());
-                    videoFrameQueue.frames.pop_front();
                     lock.unlock();
-                    videoFrameQueue.cv.notify_all();
-                } else if (kenBurnsActive) {
-                    // 图片场景 + Ken Burns：从特效序列按帧拉取。
-                    if (!effectProcessor.fetchKenBurnsFrame(videoFrame)) {
-                        m_errorString = "获取Ken Burns缓存帧失败: " + effectProcessor.getErrorString();
-                        return false;
-                    }
-                } else {
-                    // 静态图片场景：复用同一源帧。
-                    videoFrame = FFmpegUtils::copyAvFrame(sourceImageFrame.get());
+                    continue;
                 }
 
-                if (!videoFrame) {
-                    m_errorString = "生成或处理视频帧失败";
-                    return false;
+                int available = static_cast<int>(layer.channels[0].size());
+                int take = std::min(requiredSamples - consumed, available);
+                if (take > 0)
+                {
+                    hasActiveLayer = true;
+                    for (int i = 0; i < take; ++i)
+                    {
+                        const int dstIndex = silentSamples + consumed + i;
+                        m_mixBufferLeft[dstIndex] += layer.channels[0].front();
+                        layer.channels[0].pop_front();
+                        m_mixBufferRight[dstIndex] += layer.channels[1].front();
+                        layer.channels[1].pop_front();
+                    }
+                    consumed += take;
+                    bool bufferHasData = !layer.channels[0].empty() || !layer.channels[1].empty();
+                    if (bufferHasData || !layer.finished)
+                    {
+                        hasPendingAudio = true;
+                    }
                 }
+                lock.unlock();
+                layer.cv.notify_all();
+            }
 
-                cacheSceneFirstFrame(scene, videoFrame.get());
-                lastFrameCopy = FFmpegUtils::copyAvFrame(videoFrame.get());
-                videoFrame->pts = m_frameCount;
-                int ret = avcodec_send_frame(m_videoCodecContext.get(), videoFrame.get());
-                if (ret < 0) {
-                    m_errorString = format_ffmpeg_error(ret, "发送视频帧到编码器失败");
-                    return false;
-                }
-                auto packet = FFmpegUtils::createAvPacket();
-                while ((ret = avcodec_receive_packet(m_videoCodecContext.get(), packet.get())) == 0) {
-                    packet->stream_index = m_videoStream->index;
-                    av_packet_rescale_ts(packet.get(), m_videoCodecContext->time_base, m_videoStream->time_base);
-                    ret = av_interleaved_write_frame(m_outputContext.get(), packet.get());
-                    if (ret < 0) {
-                        m_errorString = format_ffmpeg_error(ret, "写入视频包失败");
-                        return false;
-                    }
-                    av_packet_unref(packet.get());
-                }
-                if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
-                     m_errorString = format_ffmpeg_error(ret, "从编码器接收视频包失败");
-                     return false;
-                }
-                m_frameCount++;
-                updateAndReportProgress();
-
-            } else {
-                // --- AUDIO PART ---
-                if (m_audioStream) {
-                    const int frame_size = (m_audioCodecContext && m_audioCodecContext->frame_size > 0) ? m_audioCodecContext->frame_size : 1024;
-                    if (av_audio_fifo_size(m_audioFifo) < frame_size) {
-                        if (!mixSceneAudio(frame_size)) {
-                            return false;
-                        }
-                    }
-                    if (!sendBufferedAudioFrames()) {
-                        return false;
-                    }
-                }
+            if (!layer.finished)
+            {
+                hasPendingAudio = true;
             }
         }
-        if (lastFrameCopy) {
-            storeSceneFrame(m_sceneLastFrames, scene, std::move(lastFrameCopy));
+
+        if (!hasActiveLayer && !hasPendingAudio)
+        {
+            // 所有音轨都结束后，补静音保持音视频时间轴连续。
+            return enqueueSilenceFrame(samplesNeeded);
         }
+
+        if (!ensureReusableAudioFrame(samplesNeeded))
+        {
+            return false;
+        }
+
+        AVFrame* mixedFrame = m_reusableMixFrame.get();
+        const int outputChannels =
+            m_audioCodecContext->ch_layout.nb_channels > 0 ? m_audioCodecContext->ch_layout.nb_channels : 2;
+        for (int ch = 0; ch < outputChannels && ch < 2; ++ch)
+        {
+            float* dst = reinterpret_cast<float*>(mixedFrame->data[ch]);
+            const auto& source = (ch == 0) ? m_mixBufferLeft : m_mixBufferRight;
+            for (int i = 0; i < samplesNeeded; ++i)
+            {
+                float value = source[i];
+                value = clamp_value(value, -1.0f, 1.0f);
+                dst[i] = value;
+            }
+        }
+
+        if (av_audio_fifo_write(m_audioFifo, (void**)mixedFrame->data, mixedFrame->nb_samples) < mixedFrame->nb_samples)
+        {
+            m_errorString = "Failed to write mixed audio to FIFO";
+            return false;
+        }
+        return true;
+    };
+
+    if ((!isVideoScene || !videoSourceAvailable || sceneDuration <= 0) && !sceneAudioLayers.empty() &&
+        longestAudioDuration > 0)
+    {
+        sceneDuration = longestAudioDuration;
+        std::cerr << "Scene duration synced to audio length:" << sceneDuration << "s";
+    }
+
+    int totalVideoFramesInScene = static_cast<int>(std::round(sceneDuration * m_config.project.fps));
+    if (totalVideoFramesInScene <= 0)
+    {
+        std::cerr << "场景 " << scene.id << " 时长为0，跳过渲染。";
         return true;
     }
 
-    /**
-     * @brief 渲染场景转场。
-     *
-     * 核心逻辑：
-     * 1. 解析并准备 from/to 参考帧（优先缓存，其次按场景实时提取）；
-     * 2. 交给 EffectProcessor 运行 xfade 序列；
-     * 3. 同步补齐转场期间音频（静音或可选混音）；
-     * 4. 写入编码器并更新进度。
-     */
-    bool RenderEngine::renderTransition(const SceneConfig &transitionScene, const SceneConfig &fromScene, const SceneConfig &toScene)
+    EffectProcessor effectProcessor;
+    effectProcessor.initialize(
+        m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P, m_config.project.fps);
+
+    FFmpegUtils::AvFramePtr sourceImageFrame;
+    if (!isVideoScene && imageDecoder.getWidth() > 0)
     {
-        int64_t startAudioSampleCount = m_audioSamplesCount;
-        int totalFrames = static_cast<int>(std::round(transitionScene.duration * m_config.project.fps));
-
-        if (m_audioStream && m_enableAudioTransition) {
-            if (!renderAudioTransition(fromScene, toScene, transitionScene.duration)) {
-                return false;
-            }
+        sourceImageFrame = imageDecoder.decodeAndCache();
+        if (sourceImageFrame)
+        {
+            auto scaledFrame = imageDecoder.scaleToSize(
+                sourceImageFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
+            sourceImageFrame = scaledFrame ? std::move(scaledFrame) : std::move(sourceImageFrame);
         }
-        
-        ImageDecoder fromDecoder, toDecoder;
+    }
+    if (!isVideoScene && !sourceImageFrame)
+    {
+        sourceImageFrame = generateTestFrame(m_frameCount, m_config.project.width, m_config.project.height);
+    }
 
-        // 1) 确定起始帧（优先末帧缓存，避免重复计算）。
-        FFmpegUtils::AvFramePtr finalFromFrame;
-        auto cachedFromFrame = getCachedSceneFrame(fromScene, true);
-        bool fromFrameFromCache = static_cast<bool>(cachedFromFrame);
-        if (cachedFromFrame) {
-            finalFromFrame = std::move(cachedFromFrame);
-        } else if (fromScene.type == SceneType::VIDEO_SCENE) {
-            finalFromFrame = extractVideoSceneFrame(fromScene, true);
-            if (!finalFromFrame) {
-                return false;
-            }
-        } else if (fromScene.effects.ken_burns.enabled) {
-            if (fromScene.resources.image.path.empty() || !fromDecoder.open(fromScene.resources.image.path)) {
-                m_errorString = "无法打开转场中的起始图片";
-                return false;
-            }
-            qDebug() << "起点场景包含Ken Burns特效，计算其最后一帧。";
-            
-            double fromSceneDuration = fromScene.duration;
-            AudioDecoder tempAudioDecoder;
-            if (!fromScene.resources.audio.path.empty() && tempAudioDecoder.open(fromScene.resources.audio.path)) {
-                double audioDuration = tempAudioDecoder.getDuration();
-                if (audioDuration > 0) {
-                    fromSceneDuration = audioDuration;
+    bool kenBurnsActive = false;
+    if (!isVideoScene && scene.effects.ken_burns.enabled)
+    {
+        if (!effectProcessor.startKenBurnsSequence(
+                scene.effects.ken_burns, sourceImageFrame.get(), totalVideoFramesInScene))
+        {
+            m_errorString = "处理Ken Burns特效序列失败: " + effectProcessor.getErrorString();
+            return false;
+        }
+        kenBurnsActive = true;
+    }
+
+    int startFrameCount = m_frameCount;
+    bool videoEOF = false;
+    FFmpegUtils::AvFramePtr lastFrameCopy;
+
+    // 主渲染循环：按“谁时间戳更落后就先推进谁”的策略交织写入音视频。
+    while (m_frameCount < startFrameCount + totalVideoFramesInScene)
+    {
+        double video_time = (double)m_frameCount / m_config.project.fps;
+        double audio_time =
+            m_audioStream ? (double)m_audioSamplesCount / m_audioCodecContext->sample_rate : video_time + 1.0;
+
+        if (video_time <= audio_time)
+        {
+            // --- VIDEO PART ---
+            FFmpegUtils::AvFramePtr videoFrame;
+
+            if (isVideoScene)
+            {
+                if (videoEOF)
+                {
+                    break;
                 }
-                tempAudioDecoder.close();
+                std::unique_lock<std::mutex> lock(videoFrameQueue.mutex);
+                videoFrameQueue.cv.wait(lock,
+                    [&]()
+                    {
+                        return videoFrameQueue.stopRequested.load() || videoFrameQueue.error ||
+                               !videoFrameQueue.frames.empty() || videoFrameQueue.finished;
+                    });
+                if (videoFrameQueue.error)
+                {
+                    std::string errorCopy = videoFrameQueue.errorMessage;
+                    lock.unlock();
+                    m_errorString = errorCopy.empty() ? std::string("Video frame prefetch failed") : errorCopy;
+                    return false;
+                }
+                if (videoFrameQueue.frames.empty())
+                {
+                    if (videoFrameQueue.finished || videoFrameQueue.stopRequested.load())
+                    {
+                        videoEOF = true;
+                        lock.unlock();
+                        break;
+                    }
+                    lock.unlock();
+                    continue;
+                }
+                videoFrame = std::move(videoFrameQueue.frames.front());
+                videoFrameQueue.frames.pop_front();
+                lock.unlock();
+                videoFrameQueue.cv.notify_all();
             }
-            int totalFramesInFromScene = static_cast<int>(std::round(fromSceneDuration * m_config.project.fps));
-            if (totalFramesInFromScene <= 0) {
-                totalFramesInFromScene = 1;
-            }
-
-            auto originalFromFrame = fromDecoder.decodeAndCache();
-            if (!originalFromFrame) {
-                m_errorString = "解码 'from' 场景的原始图片失败";
-                return false;
-            }
-
-            auto scaledFromFrame = fromDecoder.scaleToSize(originalFromFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
-            if (!scaledFromFrame) {
-                m_errorString = "缩放 'from' 场景图片失败，原因: " + fromDecoder.getErrorString();
-                return false;
-            }
-            scaledFromFrame->pts = 0;
-
-            EffectProcessor fromSceneProcessor;
-            fromSceneProcessor.initialize(m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P, m_config.project.fps);
-            if (!fromSceneProcessor.startKenBurnsSequence(fromScene.effects.ken_burns, scaledFromFrame.get(), totalFramesInFromScene)) {
-                m_errorString = "处理 'from' 场景的 Ken Burns 特效失败: " + fromSceneProcessor.getErrorString();
-                return false;
-            }
-
-            FFmpegUtils::AvFramePtr lastKbFrame;
-            for (int frameIndex = 0; frameIndex < totalFramesInFromScene; ++frameIndex) {
-                if (!fromSceneProcessor.fetchKenBurnsFrame(lastKbFrame)) {
-                    m_errorString = "'from' 场景 Ken Burns 特效处理后未能获取最后一帧: " + fromSceneProcessor.getErrorString();
+            else if (kenBurnsActive)
+            {
+                // 图片场景 + Ken Burns：从特效序列按帧拉取。
+                if (!effectProcessor.fetchKenBurnsFrame(videoFrame))
+                {
+                    m_errorString = "获取Ken Burns缓存帧失败: " + effectProcessor.getErrorString();
                     return false;
                 }
             }
-            if (!lastKbFrame) {
-                m_errorString = "'from' 场景 Ken Burns 特效未生成任何帧";
-                return false;
-            }
-            finalFromFrame = FFmpegUtils::copyAvFrame(lastKbFrame.get());
-            if (!finalFromFrame) {
-                m_errorString = "'from' 场景 Ken Burns 特效最后一帧复制失败";
-                return false;
-            }
-        } else {
-            if (fromScene.resources.image.path.empty() || !fromDecoder.open(fromScene.resources.image.path)) {
-                m_errorString = "无法打开转场中的起始图片";
-                return false;
-            }
-            qDebug() << "起点场景无特效，使用缩放后的静态图片。";
-            auto fromFrame = fromDecoder.decode();
-            if (!fromFrame) {
-                m_errorString = "解码 'from' 帧失败";
-                return false;
-            }
-            finalFromFrame = fromDecoder.scaleToSize(fromFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
-        }
-        
-        if (!fromFrameFromCache && finalFromFrame) {
-            cacheSceneLastFrame(fromScene, finalFromFrame.get());
-        }
-        if (!finalFromFrame) {
-            m_errorString = "未能确定转场的起始帧";
-            return false;
-        }
-
-        // 2) 确定目标帧（优先首帧缓存，必要时根据 Ken Burns 计算首帧）。
-        FFmpegUtils::AvFramePtr scaledToFrame;
-        auto cachedToFrame = getCachedSceneFrame(toScene, false);
-        bool toFrameFromCache = static_cast<bool>(cachedToFrame);
-        if (cachedToFrame) {
-            scaledToFrame = std::move(cachedToFrame);
-        } else if (toScene.type == SceneType::VIDEO_SCENE) {
-            scaledToFrame = extractVideoSceneFrame(toScene, false);
-            if (!scaledToFrame) {
-                return false;
-            }
-        } else if (toScene.effects.ken_burns.enabled) {
-            // 同步音频时长
-            double toSceneDuration = toScene.duration;
-            AudioDecoder tempAudioDecoder;
-            if (!toScene.resources.audio.path.empty() && tempAudioDecoder.open(toScene.resources.audio.path)) {
-                double audioDuration = tempAudioDecoder.getDuration();
-                if (audioDuration > 0) {
-                    toSceneDuration = audioDuration;
-                }
-                tempAudioDecoder.close();
-            }
-            int totalFramesInToScene = static_cast<int>(std::round(toSceneDuration * m_config.project.fps));
-            if (totalFramesInToScene <= 0) {
-                totalFramesInToScene = 1;
+            else
+            {
+                // 静态图片场景：复用同一源帧。
+                videoFrame = FFmpegUtils::copyAvFrame(sourceImageFrame.get());
             }
 
-            if (toScene.resources.image.path.empty() || !toDecoder.open(toScene.resources.image.path)) {
-                m_errorString = "无法打开转场中的目标图片";
+            if (!videoFrame)
+            {
+                m_errorString = "生成或处理视频帧失败";
                 return false;
             }
 
-            auto originalToFrame = toDecoder.decode();
-            if (!originalToFrame) {
-                m_errorString = "解码 'to' 场景的原始图片失败";
-                return false;
-            }
-            auto scaledSourceFrame = toDecoder.scaleToSize(originalToFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
-            if (!scaledSourceFrame) {
-                m_errorString = "缩放 'to' 场景图片失败，原因: " + toDecoder.getErrorString();
-                return false;
-            }
-            scaledSourceFrame->pts = 0;
-
-            EffectProcessor toSceneProcessor;
-            toSceneProcessor.initialize(m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P, m_config.project.fps);
-            if (!toSceneProcessor.startKenBurnsSequence(toScene.effects.ken_burns, scaledSourceFrame.get(), totalFramesInToScene)) {
-                m_errorString = "处理 'to' 场景的 Ken Burns 特效失败: " + toSceneProcessor.getErrorString();
-                return false;
-            }
-
-            FFmpegUtils::AvFramePtr firstKbFrame;
-            if (!toSceneProcessor.fetchKenBurnsFrame(firstKbFrame)) {
-                m_errorString = "'to' 场景 Ken Burns 特效处理后未能获取第一帧: " + toSceneProcessor.getErrorString();
-                return false;
-            }
-            scaledToFrame = FFmpegUtils::copyAvFrame(firstKbFrame.get());
-            if (!scaledToFrame) {
-                m_errorString = "'to' 场景 Ken Burns 首帧复制失败";
-                return false;
-            }
-        } else {
-            if (toScene.resources.image.path.empty() || !toDecoder.open(toScene.resources.image.path)) {
-                m_errorString = "无法打开转场中的目标图片";
-                return false;
-            }
-            auto toFrame = toDecoder.decode();
-            if (!toFrame) {
-                m_errorString = "解码 'to' 帧失败";
-                return false;
-            }
-            scaledToFrame = toDecoder.scaleToSize(toFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
-            if (!scaledToFrame) {
-                m_errorString = "缩放 'to' 帧失败";
-                return false;
-            }
-        }
-
-        if (!toFrameFromCache && scaledToFrame) {
-            cacheSceneFirstFrame(toScene, scaledToFrame.get());
-        }
-        // 3) 应用转场滤镜并逐帧写入编码器。
-        EffectProcessor transitionProcessor;
-        transitionProcessor.initialize(m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P, m_config.project.fps);
-        if (!transitionProcessor.startTransitionSequence(transitionScene.transition_type, finalFromFrame.get(), scaledToFrame.get(), totalFrames)) {
-            m_errorString = "应用转场特效失败: " + transitionProcessor.getErrorString();
-            return false;
-        }
-
-        for (int frameIndex = 0; frameIndex < totalFrames; ++frameIndex)
-        {
-            FFmpegUtils::AvFramePtr blendedFrame;
-            if (!transitionProcessor.fetchTransitionFrame(blendedFrame)) {
-                m_errorString = "应用转场特效失败: " + transitionProcessor.getErrorString();
-                return false;
-            }
-            blendedFrame->pts = m_frameCount;
-            int ret = avcodec_send_frame(m_videoCodecContext.get(), blendedFrame.get());
-            if (ret < 0) {
-                m_errorString = format_ffmpeg_error(ret, "发送转场帧到编码器失败");
+            cacheSceneFirstFrame(scene, videoFrame.get());
+            lastFrameCopy = FFmpegUtils::copyAvFrame(videoFrame.get());
+            videoFrame->pts = m_frameCount;
+            int ret = avcodec_send_frame(m_videoCodecContext.get(), videoFrame.get());
+            if (ret < 0)
+            {
+                m_errorString = format_ffmpeg_error(ret, "发送视频帧到编码器失败");
                 return false;
             }
             auto packet = FFmpegUtils::createAvPacket();
-            while ((ret = avcodec_receive_packet(m_videoCodecContext.get(), packet.get())) >= 0) {
+            while ((ret = avcodec_receive_packet(m_videoCodecContext.get(), packet.get())) == 0)
+            {
                 packet->stream_index = m_videoStream->index;
                 av_packet_rescale_ts(packet.get(), m_videoCodecContext->time_base, m_videoStream->time_base);
                 ret = av_interleaved_write_frame(m_outputContext.get(), packet.get());
-                if (ret < 0) {
-                    m_errorString = format_ffmpeg_error(ret, "写入转场视频包失败");
+                if (ret < 0)
+                {
+                    m_errorString = format_ffmpeg_error(ret, "写入视频包失败");
                     return false;
                 }
                 av_packet_unref(packet.get());
             }
-            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
-                m_errorString = format_ffmpeg_error(ret, "从编码器接收转场包失败");
+            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+            {
+                m_errorString = format_ffmpeg_error(ret, "从编码器接收视频包失败");
                 return false;
-            }
-
-            if (m_audioStream) {
-                double video_time_in_scene = (double)(frameIndex + 1) / m_config.project.fps;
-                double audio_time_in_scene = (double)(m_audioSamplesCount - startAudioSampleCount) / m_audioCodecContext->sample_rate;
-                while(audio_time_in_scene < video_time_in_scene) {
-                    const int frame_size = m_audioCodecContext->frame_size;
-                    if (frame_size <= 0) break;
-                    
-                    auto audioFrame = FFmpegUtils::createAvFrame();
-                    audioFrame->nb_samples = frame_size;
-                    audioFrame->ch_layout = m_audioCodecContext->ch_layout;
-                    audioFrame->format = m_audioCodecContext->sample_fmt;
-                    audioFrame->sample_rate = m_audioCodecContext->sample_rate;
-
-                    int ret = av_frame_get_buffer(audioFrame.get(), 0);
-                    if (ret < 0) {
-                         m_errorString = format_ffmpeg_error(ret, "为静音帧分配缓冲区失败 (Transition)");
-                         return false;
-                    }
-                    ret = av_frame_make_writable(audioFrame.get());
-                     if (ret < 0) {
-                        m_errorString = format_ffmpeg_error(ret, "使静音帧可写失败 (Transition)");
-                        return false;
-                    }
-                    av_samples_set_silence(audioFrame->data, 0, audioFrame->nb_samples, audioFrame->ch_layout.nb_channels, (AVSampleFormat)audioFrame->format);
-
-                    if(av_audio_fifo_write(m_audioFifo, (void**)audioFrame->data, audioFrame->nb_samples) < audioFrame->nb_samples){
-                        m_errorString = "写入静音数据到FIFO失败 (Transition)";
-                        return false;
-                    }
-
-                    if (!sendBufferedAudioFrames()) return false;
-                     audio_time_in_scene = (double)(m_audioSamplesCount - startAudioSampleCount) / m_audioCodecContext->sample_rate;
-                }
             }
             m_frameCount++;
             updateAndReportProgress();
         }
-        return true;
-    }
-
-    /**
-     * @brief 生成音频转场混音（可选功能）。
-     *
-     * 使用线性权重对 from/to 两段音频做 cross-fade，并写入音频 FIFO。
-     */
-    bool RenderEngine::renderAudioTransition(const SceneConfig &fromScene, const SceneConfig &toScene, double duration_seconds)
-    {
-        if (!m_audioStream || !m_audioCodecContext || duration_seconds <= 0.0) return true;
-
-        const int sample_rate = m_audioCodecContext->sample_rate > 0 ? m_audioCodecContext->sample_rate : 44100;
-        int frame_size = m_audioCodecContext->frame_size;
-        if (frame_size <= 0) frame_size = 1024; // 合理的默认值
-
-        const int total_samples = static_cast<int>(std::ceil(duration_seconds * sample_rate));
-        const double vol_from = fromScene.resources.audio.volume <= 0 ? 0.0 : fromScene.resources.audio.volume;
-        const double vol_to = toScene.resources.audio.volume <= 0 ? 0.0 : toScene.resources.audio.volume;
-
-        AudioDecoder fromDecoder;
-        AudioDecoder toDecoder;
-        bool fromAvailable = !fromScene.resources.audio.path.empty() && fromDecoder.open(fromScene.resources.audio.path);
-        bool toAvailable = !toScene.resources.audio.path.empty() && toDecoder.open(toScene.resources.audio.path);
-
-        if (fromAvailable) {
-            if (!fromDecoder.applyVolumeEffect(fromScene)) {
-                qDebug() << "起始场景音量特效应用失败，继续使用原始音频。原因: " << fromDecoder.getErrorString().c_str();
-            }
-        }
-        if (toAvailable) {
-            if (!toDecoder.applyVolumeEffect(toScene)) {
-                qDebug() << "目标场景音量特效应用失败，继续使用原始音频。原因: " << toDecoder.getErrorString().c_str();
-            }
-        }
-
-        // 如果没有可用音频源，则保持旧逻辑由后续循环填充静音
-        if (!fromAvailable && !toAvailable) {
-            return true;
-        }
-
-        if (fromAvailable) {
-            double fromDuration = fromDecoder.getDuration();
-            if (fromDuration <= 0) {
-                fromDuration = fromScene.duration;
-            }
-            double start_time = std::max(0.0, fromDuration - duration_seconds);
-            fromDecoder.seek(start_time);
-        }
-
-        struct AudioBuffer {
-            std::vector<float> channels[2];
-            size_t readPos = 0;
-            bool exhausted = false;
-        };
-
-        AudioBuffer fromBuf;
-        AudioBuffer toBuf;
-
-        auto compactBuffer = [](AudioBuffer &buf) {
-            const size_t threshold = 8192;
-            if (buf.readPos > threshold) {
-                for (auto &ch : buf.channels) {
-                    if (buf.readPos <= ch.size()) {
-                        ch.erase(ch.begin(), ch.begin() + static_cast<long long>(buf.readPos));
-                    } else {
-                        ch.clear();
-                    }
-                }
-                buf.readPos = 0;
-            }
-        };
-
-        auto ensureSamples = [this](AudioDecoder &decoder, AudioBuffer &buf, int needed, bool &available) -> bool {
-            while (!buf.exhausted && static_cast<int>(buf.channels[0].size() - buf.readPos) < needed) {
-                FFmpegUtils::AvFramePtr frame;
-                int ret = decoder.decodeFrame(frame);
-                if (ret > 0 && frame) {
-                    const int nb = frame->nb_samples;
-                    int ch = frame->ch_layout.nb_channels > 0 ? frame->ch_layout.nb_channels : 1;
-                    ch = std::min(ch, 2); // 仅处理前两个声道
-                    for (int c = 0; c < ch; ++c) {
-                        float *data = reinterpret_cast<float *>(frame->data[c]);
-                        buf.channels[c].insert(buf.channels[c].end(), data, data + nb);
-                    }
-                    // 单声道时复制到右声道，保证双声道输出
-                    if (ch == 1) {
-                        buf.channels[1].insert(buf.channels[1].end(), buf.channels[0].end() - nb, buf.channels[0].end());
-                    }
-                    // 对齐两个声道长度
-                    const size_t max_len = std::max(buf.channels[0].size(), buf.channels[1].size());
-                    buf.channels[0].resize(max_len, 0.0f);
-                    buf.channels[1].resize(max_len, 0.0f);
-                }
-                else if (ret == 0) {
-                    buf.exhausted = true;
-                    break;
-                }
-                else {
-                    buf.exhausted = true;
-                    available = false;
-                    qDebug() << "音频转场解码失败，使用静音代替。";
-                    break;
-                }
-            }
-            return true;
-        };
-
-        int processed = 0;
-        while (processed < total_samples) {
-            int chunk = std::min(frame_size, total_samples - processed);
-
-            if (fromAvailable) {
-                if (!ensureSamples(fromDecoder, fromBuf, chunk, fromAvailable)) return false;
-            }
-            if (toAvailable) {
-                if (!ensureSamples(toDecoder, toBuf, chunk, toAvailable)) return false;
-            }
-
-            auto mixedFrame = FFmpegUtils::createAvFrame();
-            mixedFrame->nb_samples = chunk;
-            mixedFrame->ch_layout = m_audioCodecContext->ch_layout;
-            mixedFrame->format = m_audioCodecContext->sample_fmt;
-            mixedFrame->sample_rate = sample_rate;
-            int ret = av_frame_get_buffer(mixedFrame.get(), 0);
-            if (ret < 0) {
-                m_errorString = format_ffmpeg_error(ret, "为转场混音帧分配缓冲区失败");
-                return false;
-            }
-
-            const int channels = m_audioCodecContext->ch_layout.nb_channels > 0 ? m_audioCodecContext->ch_layout.nb_channels : 2;
-            for (int c = 0; c < channels; ++c) {
-                float *dst = reinterpret_cast<float *>(mixedFrame->data[c]);
-                for (int i = 0; i < chunk; ++i) {
-                    float s_from = 0.0f;
-                    float s_to = 0.0f;
-                    if (fromAvailable && fromBuf.readPos + i < fromBuf.channels[c % 2].size()) {
-                        s_from = fromBuf.channels[c % 2][fromBuf.readPos + i];
-                    }
-                    if (toAvailable && toBuf.readPos + i < toBuf.channels[c % 2].size()) {
-                        s_to = toBuf.channels[c % 2][toBuf.readPos + i];
-                    }
-                    double t = static_cast<double>(processed + i) / static_cast<double>(total_samples);
-                    double w_from = 1.0 - t;
-                    double w_to = t;
-                    dst[i] = static_cast<float>(s_from * w_from * vol_from + s_to * w_to * vol_to);
-                }
-            }
-
-            fromBuf.readPos += chunk;
-            toBuf.readPos += chunk;
-            compactBuffer(fromBuf);
-            compactBuffer(toBuf);
-
-            if (av_audio_fifo_write(m_audioFifo, (void **)mixedFrame->data, mixedFrame->nb_samples) < mixedFrame->nb_samples) {
-                m_errorString = "写入转场混音数据到FIFO失败";
-                return false;
-            }
-
-            if (!sendBufferedAudioFrames()) return false;
-            processed += chunk;
-        }
-
-        return true;
-    }
-
-    /**
-     * @brief 从视频场景提取首帧或末帧并缩放到输出尺寸。
-     */
-    FFmpegUtils::AvFramePtr RenderEngine::extractVideoSceneFrame(const SceneConfig &scene, bool fetchLastFrame)
-    {
-        if (scene.type != SceneType::VIDEO_SCENE) {
-            m_errorString = "场景不是视频类型";
-            return nullptr;
-        }
-        if (scene.resources.video.path.empty()) {
-            m_errorString = "视频场景缺少视频文件路径";
-            return nullptr;
-        }
-
-        VideoDecoder decoder;
-        if (!decoder.open(scene.resources.video.path)) {
-            m_errorString = "无法打开视频: " + decoder.getErrorString();
-            return nullptr;
-        }
-
-        FFmpegUtils::AvFramePtr selectedFrame;
-        bool gotFrame = false;
-
-        while (true) {
-            FFmpegUtils::AvFramePtr decodedFrame;
-            int ret = decoder.decodeFrame(decodedFrame);
-            if (ret <= 0) {
-                if (!gotFrame) {
-                    m_errorString = "无法解码视频场景帧: " + decoder.getErrorString();
-                    return nullptr;
-                }
-                break;
-            }
-            gotFrame = true;
-
-            auto scaledFrame = decoder.scaleFrame(decodedFrame.get(), m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
-            if (!scaledFrame) {
-                m_errorString = "缩放视频帧失败: " + decoder.getErrorString();
-                return nullptr;
-            }
-            selectedFrame = std::move(scaledFrame);
-
-            if (!fetchLastFrame) {
-                break;
-            }
-        }
-
-        return selectedFrame;
-    }
-
-    /**
-     * @brief 为视频场景安排首帧预取任务。
-     */
-    void RenderEngine::scheduleVideoPrefetchTasks()
-    {
-        m_sceneFirstFramePrefetch.clear();
-        const int targetWidth = m_config.project.width;
-        const int targetHeight = m_config.project.height;
-        for (const auto &scene : m_config.scenes) {
-            if (scene.type != SceneType::VIDEO_SCENE) {
-                continue;
-            }
-            if (scene.resources.video.path.empty()) {
-                continue;
-            }
-            m_sceneFirstFramePrefetch.emplace(scene.id, std::async(std::launch::async, [scene, targetWidth, targetHeight]() {
-                VideoDecoder decoder;
-                if (!decoder.open(scene.resources.video.path)) {
-                    qDebug() << "Video prefetch failed:" << scene.resources.video.path.c_str()
-                             << decoder.getErrorString().c_str();
-                    return FFmpegUtils::AvFramePtr{};
-                }
-                while (true) {
-                    FFmpegUtils::AvFramePtr decodedFrame;
-                    int ret = decoder.decodeFrame(decodedFrame);
-                    if (ret <= 0) {
-                        return FFmpegUtils::AvFramePtr{};
-                    }
-                    auto scaled = decoder.scaleFrame(decodedFrame.get(), targetWidth, targetHeight, AV_PIX_FMT_YUV420P);
-                    if (!scaled) {
-                        qDebug() << "Video frame scale failed:" << decoder.getErrorString().c_str();
-                        return FFmpegUtils::AvFramePtr{};
-                    }
-                    return scaled;
-                }
-            }));
-        }
-    }
-
-    /**
-     * @brief 解析并缓存某个场景的预取首帧结果。
-     */
-    void RenderEngine::resolveScenePrefetch(const SceneConfig &scene)
-    {
-        auto it = m_sceneFirstFramePrefetch.find(scene.id);
-        if (it == m_sceneFirstFramePrefetch.end()) {
-            return;
-        }
-        FFmpegUtils::AvFramePtr frame = it->second.get();
-        m_sceneFirstFramePrefetch.erase(it);
-        if (frame) {
-            storeSceneFrame(m_sceneFirstFrames, scene, std::move(frame));
-        }
-    }
-
-    /**
-     * @brief 为混音准备可复用音频帧，避免高频分配。
-     */
-    bool RenderEngine::ensureReusableAudioFrame(int samplesNeeded)
-    {
-        if (!m_audioCodecContext) {
-            return false;
-        }
-
-        bool allocateNew = !m_reusableMixFrame || samplesNeeded > m_reusableMixFrameCapacity;
-        if (allocateNew) {
-            m_reusableMixFrame = FFmpegUtils::createAvFrame();
-            if (!m_reusableMixFrame) {
-                m_errorString = "Failed to allocate reusable audio frame";
-                m_reusableMixFrameCapacity = 0;
-                return false;
-            }
-            m_reusableMixFrame->ch_layout = m_audioCodecContext->ch_layout;
-            m_reusableMixFrame->format = m_audioCodecContext->sample_fmt;
-            m_reusableMixFrame->sample_rate = m_audioCodecContext->sample_rate;
-            m_reusableMixFrameCapacity = samplesNeeded;
-        }
-
-        m_reusableMixFrame->nb_samples = samplesNeeded;
-        int ret = allocateNew ? av_frame_get_buffer(m_reusableMixFrame.get(), 0) : av_frame_make_writable(m_reusableMixFrame.get());
-        if (ret < 0) {
-            m_errorString = format_ffmpeg_error(ret, "Failed to prepare reusable audio frame");
-            if (allocateNew) {
-                m_reusableMixFrame.reset();
-                m_reusableMixFrameCapacity = 0;
-            }
-            return false;
-        }
-        return true;
-    }
-
-    /**
-     * @brief 写入场景帧缓存。
-     */
-    void RenderEngine::storeSceneFrame(std::unordered_map<int, FFmpegUtils::AvFramePtr> &cache, const SceneConfig &scene, FFmpegUtils::AvFramePtr frame)
-    {
-        if (!frame) {
-            return;
-        }
-        cache[scene.id] = std::move(frame);
-    }
-
-    /**
-     * @brief 缓存场景首帧。
-     */
-    void RenderEngine::cacheSceneFirstFrame(const SceneConfig &scene, const AVFrame *frame)
-    {
-        if (!frame) {
-            return;
-        }
-        if (m_sceneFirstFrames.find(scene.id) != m_sceneFirstFrames.end()) {
-            return;
-        }
-        storeSceneFrame(m_sceneFirstFrames, scene, FFmpegUtils::copyAvFrame(frame));
-    }
-
-    /**
-     * @brief 缓存场景末帧。
-     */
-    void RenderEngine::cacheSceneLastFrame(const SceneConfig &scene, const AVFrame *frame)
-    {
-        if (!frame) {
-            return;
-        }
-        storeSceneFrame(m_sceneLastFrames, scene, FFmpegUtils::copyAvFrame(frame));
-    }
-
-    /**
-     * @brief 获取缓存场景帧副本。
-     */
-    FFmpegUtils::AvFramePtr RenderEngine::getCachedSceneFrame(const SceneConfig &scene, bool lastFrame)
-    {
-        if (!lastFrame) {
-            resolveScenePrefetch(scene);
-        }
-        auto &cache = lastFrame ? m_sceneLastFrames : m_sceneFirstFrames;
-        auto it = cache.find(scene.id);
-        if (it != cache.end() && it->second) {
-            return FFmpegUtils::copyAvFrame(it->second.get());
-        }
-        return nullptr;
-    }
-
-    /**
-     * @brief 生成测试图案帧（回退路径）。
-     */
-    FFmpegUtils::AvFramePtr RenderEngine::generateTestFrame(int frameIndex, int width, int height)
-    {
-        auto frame = FFmpegUtils::createAvFrame(width, height, AV_PIX_FMT_YUV420P);
-        if (!frame) {
-            m_errorString = "创建帧失败";
-            return nullptr;
-        }
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                frame->data[0][y * frame->linesize[0] + x] = 128 + 64 * sin(x * 0.02 + frameIndex * 0.1) * cos(y * 0.02 + frameIndex * 0.05);
-            }
-        }
-        for (int y = 0; y < height / 2; y++) {
-            for (int x = 0; x < width / 2; x++) {
-                frame->data[1][y * frame->linesize[1] + x] = 128 + 64 * sin(x * 0.04 + frameIndex * 0.08);
-                frame->data[2][y * frame->linesize[2] + x] = 128 + 64 * cos(y * 0.04 + frameIndex * 0.06);
-            }
-        }
-        return frame;
-    }
-
-    /**
-     * @brief 从 FIFO 取满一帧音频并编码输出。
-     */
-    bool RenderEngine::sendBufferedAudioFrames()
-    {
-        if (!m_audioFifo || !m_audioCodecContext) return true; // Return true if no audio configured
-        const int frame_size = m_audioCodecContext->frame_size;
-        if (frame_size <= 0) return true;
-
-        while (av_audio_fifo_size(m_audioFifo) >= frame_size)
+        else
         {
-            auto frame = FFmpegUtils::createAvFrame();
-            frame->nb_samples = frame_size;
-            frame->ch_layout = m_audioCodecContext->ch_layout;
-            frame->format = m_audioCodecContext->sample_fmt;
-            frame->sample_rate = m_audioCodecContext->sample_rate;
-            int ret = av_frame_get_buffer(frame.get(), 0);
-            if (ret < 0) {
-                m_errorString = format_ffmpeg_error(ret, "为音频帧分配缓冲区失败 (FIFO)");
-                return false;
-            }
-            if (av_audio_fifo_read(m_audioFifo, (void**)frame->data, frame_size) < 0) {
-                m_errorString = "从FIFO读取音频数据失败";
-                return false;
-            }
-            frame->pts = m_audioSamplesCount;
-            m_audioSamplesCount += frame->nb_samples;
-            ret = avcodec_send_frame(m_audioCodecContext.get(), frame.get());
-            if (ret < 0) {
-                m_errorString = format_ffmpeg_error(ret, "发送音频帧到编码器失败 (FIFO)");
-                return false;
-            }
-            auto packet = FFmpegUtils::createAvPacket();
-            while ((ret = avcodec_receive_packet(m_audioCodecContext.get(), packet.get())) == 0) {
-                packet->stream_index = m_audioStream->index;
-                av_packet_rescale_ts(packet.get(), m_audioCodecContext->time_base, m_audioStream->time_base);
-                ret = av_interleaved_write_frame(m_outputContext.get(), packet.get());
-                if (ret < 0) {
-                    m_errorString = format_ffmpeg_error(ret, "写入音频包失败 (FIFO)");
+            // --- AUDIO PART ---
+            if (m_audioStream)
+            {
+                const int frame_size = (m_audioCodecContext && m_audioCodecContext->frame_size > 0)
+                                           ? m_audioCodecContext->frame_size
+                                           : 1024;
+                if (av_audio_fifo_size(m_audioFifo) < frame_size)
+                {
+                    if (!mixSceneAudio(frame_size))
+                    {
+                        return false;
+                    }
+                }
+                if (!sendBufferedAudioFrames())
+                {
                     return false;
                 }
-                av_packet_unref(packet.get());
             }
-             if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
-                m_errorString = format_ffmpeg_error(ret, "从编码器接收音频包失败 (FIFO)");
+        }
+    }
+    if (lastFrameCopy)
+    {
+        storeSceneFrame(m_sceneLastFrames, scene, std::move(lastFrameCopy));
+    }
+    return true;
+}
+
+/**
+ * @brief 渲染场景转场。
+ *
+ * 核心逻辑：
+ * 1. 解析并准备 from/to 参考帧（优先缓存，其次按场景实时提取）；
+ * 2. 交给 EffectProcessor 运行 xfade 序列；
+ * 3. 同步补齐转场期间音频（静音或可选混音）；
+ * 4. 写入编码器并更新进度。
+ */
+bool RenderEngine::renderTransition(
+    const SceneConfig& transitionScene, const SceneConfig& fromScene, const SceneConfig& toScene)
+{
+    int64_t startAudioSampleCount = m_audioSamplesCount;
+    int totalFrames = static_cast<int>(std::round(transitionScene.duration * m_config.project.fps));
+
+    if (m_audioStream && m_enableAudioTransition)
+    {
+        if (!renderAudioTransition(fromScene, toScene, transitionScene.duration))
+        {
+            return false;
+        }
+    }
+
+    ImageDecoder fromDecoder, toDecoder;
+
+    // 1) 确定起始帧（优先末帧缓存，避免重复计算）。
+    FFmpegUtils::AvFramePtr finalFromFrame;
+    auto cachedFromFrame = getCachedSceneFrame(fromScene, true);
+    bool fromFrameFromCache = static_cast<bool>(cachedFromFrame);
+    if (cachedFromFrame)
+    {
+        finalFromFrame = std::move(cachedFromFrame);
+    }
+    else if (fromScene.type == SceneType::VIDEO_SCENE)
+    {
+        finalFromFrame = extractVideoSceneFrame(fromScene, true);
+        if (!finalFromFrame)
+        {
+            return false;
+        }
+    }
+    else if (fromScene.effects.ken_burns.enabled)
+    {
+        if (fromScene.resources.image.path.empty() || !fromDecoder.open(fromScene.resources.image.path))
+        {
+            m_errorString = "无法打开转场中的起始图片";
+            return false;
+        }
+        std::cerr << "起点场景包含Ken Burns特效，计算其最后一帧。";
+
+        double fromSceneDuration = fromScene.duration;
+        AudioDecoder tempAudioDecoder;
+        if (!fromScene.resources.audio.path.empty() && tempAudioDecoder.open(fromScene.resources.audio.path))
+        {
+            double audioDuration = tempAudioDecoder.getDuration();
+            if (audioDuration > 0)
+            {
+                fromSceneDuration = audioDuration;
+            }
+            tempAudioDecoder.close();
+        }
+        int totalFramesInFromScene = static_cast<int>(std::round(fromSceneDuration * m_config.project.fps));
+        if (totalFramesInFromScene <= 0)
+        {
+            totalFramesInFromScene = 1;
+        }
+
+        auto originalFromFrame = fromDecoder.decodeAndCache();
+        if (!originalFromFrame)
+        {
+            m_errorString = "解码 'from' 场景的原始图片失败";
+            return false;
+        }
+
+        auto scaledFromFrame = fromDecoder.scaleToSize(
+            originalFromFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
+        if (!scaledFromFrame)
+        {
+            m_errorString = "缩放 'from' 场景图片失败，原因: " + fromDecoder.getErrorString();
+            return false;
+        }
+        scaledFromFrame->pts = 0;
+
+        EffectProcessor fromSceneProcessor;
+        fromSceneProcessor.initialize(
+            m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P, m_config.project.fps);
+        if (!fromSceneProcessor.startKenBurnsSequence(
+                fromScene.effects.ken_burns, scaledFromFrame.get(), totalFramesInFromScene))
+        {
+            m_errorString = "处理 'from' 场景的 Ken Burns 特效失败: " + fromSceneProcessor.getErrorString();
+            return false;
+        }
+
+        FFmpegUtils::AvFramePtr lastKbFrame;
+        for (int frameIndex = 0; frameIndex < totalFramesInFromScene; ++frameIndex)
+        {
+            if (!fromSceneProcessor.fetchKenBurnsFrame(lastKbFrame))
+            {
+                m_errorString =
+                    "'from' 场景 Ken Burns 特效处理后未能获取最后一帧: " + fromSceneProcessor.getErrorString();
                 return false;
             }
         }
-        return true;
-    }
-
-    /**
-     * @brief 冲洗音频 FIFO（不足一帧时补静音对齐）。
-     */
-    bool RenderEngine::flushAudio()
-    {
-        if (!m_audioFifo || !m_audioCodecContext) return true;
-        const int frame_size = m_audioCodecContext->frame_size;
-        if (frame_size <= 0) return true;
-        const int remaining_samples = av_audio_fifo_size(m_audioFifo);
-        if (remaining_samples > 0) {
-            const int silence_to_add = frame_size - remaining_samples;
-            auto silenceFrame = FFmpegUtils::createAvFrame();
-            silenceFrame->nb_samples = silence_to_add;
-            silenceFrame->ch_layout = m_audioCodecContext->ch_layout;
-            silenceFrame->format = m_audioCodecContext->sample_fmt;
-            silenceFrame->sample_rate = m_audioCodecContext->sample_rate;
-            int ret = av_frame_get_buffer(silenceFrame.get(), 0);
-            if (ret < 0) {
-                m_errorString = format_ffmpeg_error(ret, "为静音帧分配缓冲区失败 (Flush)");
-                return false;
-            }
-            ret = av_frame_make_writable(silenceFrame.get());
-            if(ret < 0) {
-                 m_errorString = format_ffmpeg_error(ret, "使静音帧可写失败 (Flush)");
-                 return false;
-            }
-            av_samples_set_silence(silenceFrame->data, 0, silence_to_add, silenceFrame->ch_layout.nb_channels, (AVSampleFormat)silenceFrame->format);
-            av_audio_fifo_write(m_audioFifo, (void**)silenceFrame->data, silence_to_add);
+        if (!lastKbFrame)
+        {
+            m_errorString = "'from' 场景 Ken Burns 特效未生成任何帧";
+            return false;
         }
-        return sendBufferedAudioFrames();
+        finalFromFrame = FFmpegUtils::copyAvFrame(lastKbFrame.get());
+        if (!finalFromFrame)
+        {
+            m_errorString = "'from' 场景 Ken Burns 特效最后一帧复制失败";
+            return false;
+        }
+    }
+    else
+    {
+        if (fromScene.resources.image.path.empty() || !fromDecoder.open(fromScene.resources.image.path))
+        {
+            m_errorString = "无法打开转场中的起始图片";
+            return false;
+        }
+        std::cerr << "起点场景无特效，使用缩放后的静态图片。";
+        auto fromFrame = fromDecoder.decode();
+        if (!fromFrame)
+        {
+            m_errorString = "解码 'from' 帧失败";
+            return false;
+        }
+        finalFromFrame =
+            fromDecoder.scaleToSize(fromFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
     }
 
-
-    /**
-     * @brief 冲洗编码器并写出剩余包。
-     */
-    bool RenderEngine::flushEncoder(AVCodecContext *codecCtx, AVStream *stream)
+    if (!fromFrameFromCache && finalFromFrame)
     {
-        if (!codecCtx || !stream) return true;
-        int ret = avcodec_send_frame(codecCtx, nullptr);
-        if (ret < 0 && ret != AVERROR_EOF) {
-            m_errorString = format_ffmpeg_error(ret, "发送空帧到编码器以 flush 失败");
+        cacheSceneLastFrame(fromScene, finalFromFrame.get());
+    }
+    if (!finalFromFrame)
+    {
+        m_errorString = "未能确定转场的起始帧";
+        return false;
+    }
+
+    // 2) 确定目标帧（优先首帧缓存，必要时根据 Ken Burns 计算首帧）。
+    FFmpegUtils::AvFramePtr scaledToFrame;
+    auto cachedToFrame = getCachedSceneFrame(toScene, false);
+    bool toFrameFromCache = static_cast<bool>(cachedToFrame);
+    if (cachedToFrame)
+    {
+        scaledToFrame = std::move(cachedToFrame);
+    }
+    else if (toScene.type == SceneType::VIDEO_SCENE)
+    {
+        scaledToFrame = extractVideoSceneFrame(toScene, false);
+        if (!scaledToFrame)
+        {
+            return false;
+        }
+    }
+    else if (toScene.effects.ken_burns.enabled)
+    {
+        // 同步音频时长
+        double toSceneDuration = toScene.duration;
+        AudioDecoder tempAudioDecoder;
+        if (!toScene.resources.audio.path.empty() && tempAudioDecoder.open(toScene.resources.audio.path))
+        {
+            double audioDuration = tempAudioDecoder.getDuration();
+            if (audioDuration > 0)
+            {
+                toSceneDuration = audioDuration;
+            }
+            tempAudioDecoder.close();
+        }
+        int totalFramesInToScene = static_cast<int>(std::round(toSceneDuration * m_config.project.fps));
+        if (totalFramesInToScene <= 0)
+        {
+            totalFramesInToScene = 1;
+        }
+
+        if (toScene.resources.image.path.empty() || !toDecoder.open(toScene.resources.image.path))
+        {
+            m_errorString = "无法打开转场中的目标图片";
+            return false;
+        }
+
+        auto originalToFrame = toDecoder.decode();
+        if (!originalToFrame)
+        {
+            m_errorString = "解码 'to' 场景的原始图片失败";
+            return false;
+        }
+        auto scaledSourceFrame =
+            toDecoder.scaleToSize(originalToFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
+        if (!scaledSourceFrame)
+        {
+            m_errorString = "缩放 'to' 场景图片失败，原因: " + toDecoder.getErrorString();
+            return false;
+        }
+        scaledSourceFrame->pts = 0;
+
+        EffectProcessor toSceneProcessor;
+        toSceneProcessor.initialize(
+            m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P, m_config.project.fps);
+        if (!toSceneProcessor.startKenBurnsSequence(
+                toScene.effects.ken_burns, scaledSourceFrame.get(), totalFramesInToScene))
+        {
+            m_errorString = "处理 'to' 场景的 Ken Burns 特效失败: " + toSceneProcessor.getErrorString();
+            return false;
+        }
+
+        FFmpegUtils::AvFramePtr firstKbFrame;
+        if (!toSceneProcessor.fetchKenBurnsFrame(firstKbFrame))
+        {
+            m_errorString = "'to' 场景 Ken Burns 特效处理后未能获取第一帧: " + toSceneProcessor.getErrorString();
+            return false;
+        }
+        scaledToFrame = FFmpegUtils::copyAvFrame(firstKbFrame.get());
+        if (!scaledToFrame)
+        {
+            m_errorString = "'to' 场景 Ken Burns 首帧复制失败";
+            return false;
+        }
+    }
+    else
+    {
+        if (toScene.resources.image.path.empty() || !toDecoder.open(toScene.resources.image.path))
+        {
+            m_errorString = "无法打开转场中的目标图片";
+            return false;
+        }
+        auto toFrame = toDecoder.decode();
+        if (!toFrame)
+        {
+            m_errorString = "解码 'to' 帧失败";
+            return false;
+        }
+        scaledToFrame =
+            toDecoder.scaleToSize(toFrame, m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
+        if (!scaledToFrame)
+        {
+            m_errorString = "缩放 'to' 帧失败";
+            return false;
+        }
+    }
+
+    if (!toFrameFromCache && scaledToFrame)
+    {
+        cacheSceneFirstFrame(toScene, scaledToFrame.get());
+    }
+    // 3) 应用转场滤镜并逐帧写入编码器。
+    EffectProcessor transitionProcessor;
+    transitionProcessor.initialize(
+        m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P, m_config.project.fps);
+    if (!transitionProcessor.startTransitionSequence(
+            transitionScene.transition_type, finalFromFrame.get(), scaledToFrame.get(), totalFrames))
+    {
+        m_errorString = "应用转场特效失败: " + transitionProcessor.getErrorString();
+        return false;
+    }
+
+    for (int frameIndex = 0; frameIndex < totalFrames; ++frameIndex)
+    {
+        FFmpegUtils::AvFramePtr blendedFrame;
+        if (!transitionProcessor.fetchTransitionFrame(blendedFrame))
+        {
+            m_errorString = "应用转场特效失败: " + transitionProcessor.getErrorString();
+            return false;
+        }
+        blendedFrame->pts = m_frameCount;
+        int ret = avcodec_send_frame(m_videoCodecContext.get(), blendedFrame.get());
+        if (ret < 0)
+        {
+            m_errorString = format_ffmpeg_error(ret, "发送转场帧到编码器失败");
             return false;
         }
         auto packet = FFmpegUtils::createAvPacket();
-        while (true)
+        while ((ret = avcodec_receive_packet(m_videoCodecContext.get(), packet.get())) >= 0)
         {
-            ret = avcodec_receive_packet(codecCtx, packet.get());
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-            if (ret < 0) {
-                m_errorString = format_ffmpeg_error(ret, "从编码器接收包失败 (flush)");
-                return false;
-            }
-            packet->stream_index = stream->index;
-            av_packet_rescale_ts(packet.get(), codecCtx->time_base, stream->time_base);
+            packet->stream_index = m_videoStream->index;
+            av_packet_rescale_ts(packet.get(), m_videoCodecContext->time_base, m_videoStream->time_base);
             ret = av_interleaved_write_frame(m_outputContext.get(), packet.get());
-            if (ret < 0) {
-                m_errorString = format_ffmpeg_error(ret, "写入包失败 (flush)");
+            if (ret < 0)
+            {
+                m_errorString = format_ffmpeg_error(ret, "写入转场视频包失败");
                 return false;
             }
             av_packet_unref(packet.get());
         }
+        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+        {
+            m_errorString = format_ffmpeg_error(ret, "从编码器接收转场包失败");
+            return false;
+        }
+
+        if (m_audioStream)
+        {
+            double video_time_in_scene = (double)(frameIndex + 1) / m_config.project.fps;
+            double audio_time_in_scene =
+                (double)(m_audioSamplesCount - startAudioSampleCount) / m_audioCodecContext->sample_rate;
+            while (audio_time_in_scene < video_time_in_scene)
+            {
+                const int frame_size = m_audioCodecContext->frame_size;
+                if (frame_size <= 0)
+                    break;
+
+                auto audioFrame = FFmpegUtils::createAvFrame();
+                audioFrame->nb_samples = frame_size;
+                audioFrame->ch_layout = m_audioCodecContext->ch_layout;
+                audioFrame->format = m_audioCodecContext->sample_fmt;
+                audioFrame->sample_rate = m_audioCodecContext->sample_rate;
+
+                int ret = av_frame_get_buffer(audioFrame.get(), 0);
+                if (ret < 0)
+                {
+                    m_errorString = format_ffmpeg_error(ret, "为静音帧分配缓冲区失败 (Transition)");
+                    return false;
+                }
+                ret = av_frame_make_writable(audioFrame.get());
+                if (ret < 0)
+                {
+                    m_errorString = format_ffmpeg_error(ret, "使静音帧可写失败 (Transition)");
+                    return false;
+                }
+                av_samples_set_silence(audioFrame->data,
+                    0,
+                    audioFrame->nb_samples,
+                    audioFrame->ch_layout.nb_channels,
+                    (AVSampleFormat)audioFrame->format);
+
+                if (av_audio_fifo_write(m_audioFifo, (void**)audioFrame->data, audioFrame->nb_samples) <
+                    audioFrame->nb_samples)
+                {
+                    m_errorString = "写入静音数据到FIFO失败 (Transition)";
+                    return false;
+                }
+
+                if (!sendBufferedAudioFrames())
+                    return false;
+                audio_time_in_scene =
+                    (double)(m_audioSamplesCount - startAudioSampleCount) / m_audioCodecContext->sample_rate;
+            }
+        }
+        m_frameCount++;
+        updateAndReportProgress();
+    }
+    return true;
+}
+
+/**
+ * @brief 生成音频转场混音（可选功能）。
+ *
+ * 使用线性权重对 from/to 两段音频做 cross-fade，并写入音频 FIFO。
+ */
+bool RenderEngine::renderAudioTransition(
+    const SceneConfig& fromScene, const SceneConfig& toScene, double duration_seconds)
+{
+    if (!m_audioStream || !m_audioCodecContext || duration_seconds <= 0.0)
+        return true;
+
+    const int sample_rate = m_audioCodecContext->sample_rate > 0 ? m_audioCodecContext->sample_rate : 44100;
+    int frame_size = m_audioCodecContext->frame_size;
+    if (frame_size <= 0)
+        frame_size = 1024; // 合理的默认值
+
+    const int total_samples = static_cast<int>(std::ceil(duration_seconds * sample_rate));
+    const double vol_from = fromScene.resources.audio.volume <= 0 ? 0.0 : fromScene.resources.audio.volume;
+    const double vol_to = toScene.resources.audio.volume <= 0 ? 0.0 : toScene.resources.audio.volume;
+
+    AudioDecoder fromDecoder;
+    AudioDecoder toDecoder;
+    bool fromAvailable = !fromScene.resources.audio.path.empty() && fromDecoder.open(fromScene.resources.audio.path);
+    bool toAvailable = !toScene.resources.audio.path.empty() && toDecoder.open(toScene.resources.audio.path);
+
+    if (fromAvailable)
+    {
+        if (!fromDecoder.applyVolumeEffect(fromScene))
+        {
+            std::cerr << "起始场景音量特效应用失败，继续使用原始音频。原因: " << fromDecoder.getErrorString().c_str();
+        }
+    }
+    if (toAvailable)
+    {
+        if (!toDecoder.applyVolumeEffect(toScene))
+        {
+            std::cerr << "目标场景音量特效应用失败，继续使用原始音频。原因: " << toDecoder.getErrorString().c_str();
+        }
+    }
+
+    // 如果没有可用音频源，则保持旧逻辑由后续循环填充静音
+    if (!fromAvailable && !toAvailable)
+    {
         return true;
     }
 
-    /**
-     * @brief 计算并更新渲染进度。
-     */
-    void RenderEngine::updateAndReportProgress()
+    if (fromAvailable)
     {
-        if (m_totalProjectFrames > 0) {
-            m_progress = static_cast<int>((m_frameCount / m_totalProjectFrames) * 100);
-            if (m_progress > m_lastReportedProgress) {
-                m_lastReportedProgress = m_progress;
+        double fromDuration = fromDecoder.getDuration();
+        if (fromDuration <= 0)
+        {
+            fromDuration = fromScene.duration;
+        }
+        double start_time = std::max(0.0, fromDuration - duration_seconds);
+        fromDecoder.seek(start_time);
+    }
+
+    struct AudioBuffer
+    {
+        std::vector<float> channels[2];
+        size_t readPos = 0;
+        bool exhausted = false;
+    };
+
+    AudioBuffer fromBuf;
+    AudioBuffer toBuf;
+
+    auto compactBuffer = [](AudioBuffer& buf)
+    {
+        const size_t threshold = 8192;
+        if (buf.readPos > threshold)
+        {
+            for (auto& ch : buf.channels)
+            {
+                if (buf.readPos <= ch.size())
+                {
+                    ch.erase(ch.begin(), ch.begin() + static_cast<long long>(buf.readPos));
+                }
+                else
+                {
+                    ch.clear();
+                }
+            }
+            buf.readPos = 0;
+        }
+    };
+
+    auto ensureSamples = [this](AudioDecoder& decoder, AudioBuffer& buf, int needed, bool& available) -> bool
+    {
+        while (!buf.exhausted && static_cast<int>(buf.channels[0].size() - buf.readPos) < needed)
+        {
+            FFmpegUtils::AvFramePtr frame;
+            int ret = decoder.decodeFrame(frame);
+            if (ret > 0 && frame)
+            {
+                const int nb = frame->nb_samples;
+                int ch = frame->ch_layout.nb_channels > 0 ? frame->ch_layout.nb_channels : 1;
+                ch = std::min(ch, 2); // 仅处理前两个声道
+                for (int c = 0; c < ch; ++c)
+                {
+                    float* data = reinterpret_cast<float*>(frame->data[c]);
+                    buf.channels[c].insert(buf.channels[c].end(), data, data + nb);
+                }
+                // 单声道时复制到右声道，保证双声道输出
+                if (ch == 1)
+                {
+                    buf.channels[1].insert(buf.channels[1].end(), buf.channels[0].end() - nb, buf.channels[0].end());
+                }
+                // 对齐两个声道长度
+                const size_t max_len = std::max(buf.channels[0].size(), buf.channels[1].size());
+                buf.channels[0].resize(max_len, 0.0f);
+                buf.channels[1].resize(max_len, 0.0f);
+            }
+            else if (ret == 0)
+            {
+                buf.exhausted = true;
+                break;
+            }
+            else
+            {
+                buf.exhausted = true;
+                available = false;
+                std::cerr << "音频转场解码失败，使用静音代替。";
+                break;
             }
         }
+        return true;
+    };
+
+    int processed = 0;
+    while (processed < total_samples)
+    {
+        int chunk = std::min(frame_size, total_samples - processed);
+
+        if (fromAvailable)
+        {
+            if (!ensureSamples(fromDecoder, fromBuf, chunk, fromAvailable))
+                return false;
+        }
+        if (toAvailable)
+        {
+            if (!ensureSamples(toDecoder, toBuf, chunk, toAvailable))
+                return false;
+        }
+
+        auto mixedFrame = FFmpegUtils::createAvFrame();
+        mixedFrame->nb_samples = chunk;
+        mixedFrame->ch_layout = m_audioCodecContext->ch_layout;
+        mixedFrame->format = m_audioCodecContext->sample_fmt;
+        mixedFrame->sample_rate = sample_rate;
+        int ret = av_frame_get_buffer(mixedFrame.get(), 0);
+        if (ret < 0)
+        {
+            m_errorString = format_ffmpeg_error(ret, "为转场混音帧分配缓冲区失败");
+            return false;
+        }
+
+        const int channels =
+            m_audioCodecContext->ch_layout.nb_channels > 0 ? m_audioCodecContext->ch_layout.nb_channels : 2;
+        for (int c = 0; c < channels; ++c)
+        {
+            float* dst = reinterpret_cast<float*>(mixedFrame->data[c]);
+            for (int i = 0; i < chunk; ++i)
+            {
+                float s_from = 0.0f;
+                float s_to = 0.0f;
+                if (fromAvailable && fromBuf.readPos + i < fromBuf.channels[c % 2].size())
+                {
+                    s_from = fromBuf.channels[c % 2][fromBuf.readPos + i];
+                }
+                if (toAvailable && toBuf.readPos + i < toBuf.channels[c % 2].size())
+                {
+                    s_to = toBuf.channels[c % 2][toBuf.readPos + i];
+                }
+                double t = static_cast<double>(processed + i) / static_cast<double>(total_samples);
+                double w_from = 1.0 - t;
+                double w_to = t;
+                dst[i] = static_cast<float>(s_from * w_from * vol_from + s_to * w_to * vol_to);
+            }
+        }
+
+        fromBuf.readPos += chunk;
+        toBuf.readPos += chunk;
+        compactBuffer(fromBuf);
+        compactBuffer(toBuf);
+
+        if (av_audio_fifo_write(m_audioFifo, (void**)mixedFrame->data, mixedFrame->nb_samples) < mixedFrame->nb_samples)
+        {
+            m_errorString = "写入转场混音数据到FIFO失败";
+            return false;
+        }
+
+        if (!sendBufferedAudioFrames())
+            return false;
+        processed += chunk;
     }
+
+    return true;
+}
+
+/**
+ * @brief 从视频场景提取首帧或末帧并缩放到输出尺寸。
+ */
+FFmpegUtils::AvFramePtr RenderEngine::extractVideoSceneFrame(const SceneConfig& scene, bool fetchLastFrame)
+{
+    if (scene.type != SceneType::VIDEO_SCENE)
+    {
+        m_errorString = "场景不是视频类型";
+        return nullptr;
+    }
+    if (scene.resources.video.path.empty())
+    {
+        m_errorString = "视频场景缺少视频文件路径";
+        return nullptr;
+    }
+
+    VideoDecoder decoder;
+    if (!decoder.open(scene.resources.video.path))
+    {
+        m_errorString = "无法打开视频: " + decoder.getErrorString();
+        return nullptr;
+    }
+
+    FFmpegUtils::AvFramePtr selectedFrame;
+    bool gotFrame = false;
+
+    while (true)
+    {
+        FFmpegUtils::AvFramePtr decodedFrame;
+        int ret = decoder.decodeFrame(decodedFrame);
+        if (ret <= 0)
+        {
+            if (!gotFrame)
+            {
+                m_errorString = "无法解码视频场景帧: " + decoder.getErrorString();
+                return nullptr;
+            }
+            break;
+        }
+        gotFrame = true;
+
+        auto scaledFrame =
+            decoder.scaleFrame(decodedFrame.get(), m_config.project.width, m_config.project.height, AV_PIX_FMT_YUV420P);
+        if (!scaledFrame)
+        {
+            m_errorString = "缩放视频帧失败: " + decoder.getErrorString();
+            return nullptr;
+        }
+        selectedFrame = std::move(scaledFrame);
+
+        if (!fetchLastFrame)
+        {
+            break;
+        }
+    }
+
+    return selectedFrame;
+}
+
+/**
+ * @brief 为视频场景安排首帧预取任务。
+ */
+void RenderEngine::scheduleVideoPrefetchTasks()
+{
+    m_sceneFirstFramePrefetch.clear();
+    const int targetWidth = m_config.project.width;
+    const int targetHeight = m_config.project.height;
+    for (const auto& scene : m_config.scenes)
+    {
+        if (scene.type != SceneType::VIDEO_SCENE)
+        {
+            continue;
+        }
+        if (scene.resources.video.path.empty())
+        {
+            continue;
+        }
+        m_sceneFirstFramePrefetch.emplace(scene.id,
+            std::async(std::launch::async,
+                [scene, targetWidth, targetHeight]()
+                {
+                    VideoDecoder decoder;
+                    if (!decoder.open(scene.resources.video.path))
+                    {
+                        std::cerr << "Video prefetch failed:" << scene.resources.video.path.c_str()
+                                  << decoder.getErrorString().c_str();
+                        return FFmpegUtils::AvFramePtr{};
+                    }
+                    while (true)
+                    {
+                        FFmpegUtils::AvFramePtr decodedFrame;
+                        int ret = decoder.decodeFrame(decodedFrame);
+                        if (ret <= 0)
+                        {
+                            return FFmpegUtils::AvFramePtr{};
+                        }
+                        auto scaled =
+                            decoder.scaleFrame(decodedFrame.get(), targetWidth, targetHeight, AV_PIX_FMT_YUV420P);
+                        if (!scaled)
+                        {
+                            std::cerr << "Video frame scale failed:" << decoder.getErrorString().c_str();
+                            return FFmpegUtils::AvFramePtr{};
+                        }
+                        return scaled;
+                    }
+                }));
+    }
+}
+
+/**
+ * @brief 解析并缓存某个场景的预取首帧结果。
+ */
+void RenderEngine::resolveScenePrefetch(const SceneConfig& scene)
+{
+    auto it = m_sceneFirstFramePrefetch.find(scene.id);
+    if (it == m_sceneFirstFramePrefetch.end())
+    {
+        return;
+    }
+    FFmpegUtils::AvFramePtr frame = it->second.get();
+    m_sceneFirstFramePrefetch.erase(it);
+    if (frame)
+    {
+        storeSceneFrame(m_sceneFirstFrames, scene, std::move(frame));
+    }
+}
+
+/**
+ * @brief 为混音准备可复用音频帧，避免高频分配。
+ */
+bool RenderEngine::ensureReusableAudioFrame(int samplesNeeded)
+{
+    if (!m_audioCodecContext)
+    {
+        return false;
+    }
+
+    bool allocateNew = !m_reusableMixFrame || samplesNeeded > m_reusableMixFrameCapacity;
+    if (allocateNew)
+    {
+        m_reusableMixFrame = FFmpegUtils::createAvFrame();
+        if (!m_reusableMixFrame)
+        {
+            m_errorString = "Failed to allocate reusable audio frame";
+            m_reusableMixFrameCapacity = 0;
+            return false;
+        }
+        m_reusableMixFrame->ch_layout = m_audioCodecContext->ch_layout;
+        m_reusableMixFrame->format = m_audioCodecContext->sample_fmt;
+        m_reusableMixFrame->sample_rate = m_audioCodecContext->sample_rate;
+        m_reusableMixFrameCapacity = samplesNeeded;
+    }
+
+    m_reusableMixFrame->nb_samples = samplesNeeded;
+    int ret = allocateNew ? av_frame_get_buffer(m_reusableMixFrame.get(), 0)
+                          : av_frame_make_writable(m_reusableMixFrame.get());
+    if (ret < 0)
+    {
+        m_errorString = format_ffmpeg_error(ret, "Failed to prepare reusable audio frame");
+        if (allocateNew)
+        {
+            m_reusableMixFrame.reset();
+            m_reusableMixFrameCapacity = 0;
+        }
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief 写入场景帧缓存。
+ */
+void RenderEngine::storeSceneFrame(
+    std::unordered_map<int, FFmpegUtils::AvFramePtr>& cache, const SceneConfig& scene, FFmpegUtils::AvFramePtr frame)
+{
+    if (!frame)
+    {
+        return;
+    }
+    cache[scene.id] = std::move(frame);
+}
+
+/**
+ * @brief 缓存场景首帧。
+ */
+void RenderEngine::cacheSceneFirstFrame(const SceneConfig& scene, const AVFrame* frame)
+{
+    if (!frame)
+    {
+        return;
+    }
+    if (m_sceneFirstFrames.find(scene.id) != m_sceneFirstFrames.end())
+    {
+        return;
+    }
+    storeSceneFrame(m_sceneFirstFrames, scene, FFmpegUtils::copyAvFrame(frame));
+}
+
+/**
+ * @brief 缓存场景末帧。
+ */
+void RenderEngine::cacheSceneLastFrame(const SceneConfig& scene, const AVFrame* frame)
+{
+    if (!frame)
+    {
+        return;
+    }
+    storeSceneFrame(m_sceneLastFrames, scene, FFmpegUtils::copyAvFrame(frame));
+}
+
+/**
+ * @brief 获取缓存场景帧副本。
+ */
+FFmpegUtils::AvFramePtr RenderEngine::getCachedSceneFrame(const SceneConfig& scene, bool lastFrame)
+{
+    if (!lastFrame)
+    {
+        resolveScenePrefetch(scene);
+    }
+    auto& cache = lastFrame ? m_sceneLastFrames : m_sceneFirstFrames;
+    auto it = cache.find(scene.id);
+    if (it != cache.end() && it->second)
+    {
+        return FFmpegUtils::copyAvFrame(it->second.get());
+    }
+    return nullptr;
+}
+
+/**
+ * @brief 生成测试图案帧（回退路径）。
+ */
+FFmpegUtils::AvFramePtr RenderEngine::generateTestFrame(int frameIndex, int width, int height)
+{
+    auto frame = FFmpegUtils::createAvFrame(width, height, AV_PIX_FMT_YUV420P);
+    if (!frame)
+    {
+        m_errorString = "创建帧失败";
+        return nullptr;
+    }
+    for (int y = 0; y < height; y++)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            frame->data[0][y * frame->linesize[0] + x] =
+                128 + 64 * sin(x * 0.02 + frameIndex * 0.1) * cos(y * 0.02 + frameIndex * 0.05);
+        }
+    }
+    for (int y = 0; y < height / 2; y++)
+    {
+        for (int x = 0; x < width / 2; x++)
+        {
+            frame->data[1][y * frame->linesize[1] + x] = 128 + 64 * sin(x * 0.04 + frameIndex * 0.08);
+            frame->data[2][y * frame->linesize[2] + x] = 128 + 64 * cos(y * 0.04 + frameIndex * 0.06);
+        }
+    }
+    return frame;
+}
+
+/**
+ * @brief 从 FIFO 取满一帧音频并编码输出。
+ */
+bool RenderEngine::sendBufferedAudioFrames()
+{
+    if (!m_audioFifo || !m_audioCodecContext)
+        return true; // Return true if no audio configured
+    const int frame_size = m_audioCodecContext->frame_size;
+    if (frame_size <= 0)
+        return true;
+
+    while (av_audio_fifo_size(m_audioFifo) >= frame_size)
+    {
+        auto frame = FFmpegUtils::createAvFrame();
+        frame->nb_samples = frame_size;
+        frame->ch_layout = m_audioCodecContext->ch_layout;
+        frame->format = m_audioCodecContext->sample_fmt;
+        frame->sample_rate = m_audioCodecContext->sample_rate;
+        int ret = av_frame_get_buffer(frame.get(), 0);
+        if (ret < 0)
+        {
+            m_errorString = format_ffmpeg_error(ret, "为音频帧分配缓冲区失败 (FIFO)");
+            return false;
+        }
+        if (av_audio_fifo_read(m_audioFifo, (void**)frame->data, frame_size) < 0)
+        {
+            m_errorString = "从FIFO读取音频数据失败";
+            return false;
+        }
+        frame->pts = m_audioSamplesCount;
+        m_audioSamplesCount += frame->nb_samples;
+        ret = avcodec_send_frame(m_audioCodecContext.get(), frame.get());
+        if (ret < 0)
+        {
+            m_errorString = format_ffmpeg_error(ret, "发送音频帧到编码器失败 (FIFO)");
+            return false;
+        }
+        auto packet = FFmpegUtils::createAvPacket();
+        while ((ret = avcodec_receive_packet(m_audioCodecContext.get(), packet.get())) == 0)
+        {
+            packet->stream_index = m_audioStream->index;
+            av_packet_rescale_ts(packet.get(), m_audioCodecContext->time_base, m_audioStream->time_base);
+            ret = av_interleaved_write_frame(m_outputContext.get(), packet.get());
+            if (ret < 0)
+            {
+                m_errorString = format_ffmpeg_error(ret, "写入音频包失败 (FIFO)");
+                return false;
+            }
+            av_packet_unref(packet.get());
+        }
+        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+        {
+            m_errorString = format_ffmpeg_error(ret, "从编码器接收音频包失败 (FIFO)");
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief 冲洗音频 FIFO（不足一帧时补静音对齐）。
+ */
+bool RenderEngine::flushAudio()
+{
+    if (!m_audioFifo || !m_audioCodecContext)
+        return true;
+    const int frame_size = m_audioCodecContext->frame_size;
+    if (frame_size <= 0)
+        return true;
+    const int remaining_samples = av_audio_fifo_size(m_audioFifo);
+    if (remaining_samples > 0)
+    {
+        const int silence_to_add = frame_size - remaining_samples;
+        auto silenceFrame = FFmpegUtils::createAvFrame();
+        silenceFrame->nb_samples = silence_to_add;
+        silenceFrame->ch_layout = m_audioCodecContext->ch_layout;
+        silenceFrame->format = m_audioCodecContext->sample_fmt;
+        silenceFrame->sample_rate = m_audioCodecContext->sample_rate;
+        int ret = av_frame_get_buffer(silenceFrame.get(), 0);
+        if (ret < 0)
+        {
+            m_errorString = format_ffmpeg_error(ret, "为静音帧分配缓冲区失败 (Flush)");
+            return false;
+        }
+        ret = av_frame_make_writable(silenceFrame.get());
+        if (ret < 0)
+        {
+            m_errorString = format_ffmpeg_error(ret, "使静音帧可写失败 (Flush)");
+            return false;
+        }
+        av_samples_set_silence(silenceFrame->data,
+            0,
+            silence_to_add,
+            silenceFrame->ch_layout.nb_channels,
+            (AVSampleFormat)silenceFrame->format);
+        av_audio_fifo_write(m_audioFifo, (void**)silenceFrame->data, silence_to_add);
+    }
+    return sendBufferedAudioFrames();
+}
+
+/**
+ * @brief 冲洗编码器并写出剩余包。
+ */
+bool RenderEngine::flushEncoder(AVCodecContext* codecCtx, AVStream* stream)
+{
+    if (!codecCtx || !stream)
+        return true;
+    int ret = avcodec_send_frame(codecCtx, nullptr);
+    if (ret < 0 && ret != AVERROR_EOF)
+    {
+        m_errorString = format_ffmpeg_error(ret, "发送空帧到编码器以 flush 失败");
+        return false;
+    }
+    auto packet = FFmpegUtils::createAvPacket();
+    while (true)
+    {
+        ret = avcodec_receive_packet(codecCtx, packet.get());
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            break;
+        if (ret < 0)
+        {
+            m_errorString = format_ffmpeg_error(ret, "从编码器接收包失败 (flush)");
+            return false;
+        }
+        packet->stream_index = stream->index;
+        av_packet_rescale_ts(packet.get(), codecCtx->time_base, stream->time_base);
+        ret = av_interleaved_write_frame(m_outputContext.get(), packet.get());
+        if (ret < 0)
+        {
+            m_errorString = format_ffmpeg_error(ret, "写入包失败 (flush)");
+            return false;
+        }
+        av_packet_unref(packet.get());
+    }
+    return true;
+}
+
+/**
+ * @brief 计算并更新渲染进度。
+ */
+void RenderEngine::updateAndReportProgress()
+{
+    if (m_totalProjectFrames > 0)
+    {
+        m_progress = static_cast<int>((m_frameCount / m_totalProjectFrames) * 100);
+        if (m_progress > m_lastReportedProgress)
+        {
+            m_lastReportedProgress = m_progress;
+        }
+    }
+}
 
 } // namespace VideoCreator

@@ -119,6 +119,8 @@ set(VIDEOCREATOR_CORE_SOURCES
     src/decoder/AudioDecoder.h
     src/decoder/VideoDecoder.cpp
     src/decoder/VideoDecoder.h
+    src/decoder/FrameScaler.h
+    src/decoder/VideoLikeDecoderCore.h
     src/filter/EffectProcessor.cpp
     src/filter/EffectProcessor.h
     src/ffmpeg_utils/AvFrameWrapper.h
@@ -159,7 +161,6 @@ target_include_directories(VideoCreatorCore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/engine
     ${CMAKE_CURRENT_SOURCE_DIR}/src/decoder
     ${CMAKE_CURRENT_SOURCE_DIR}/src/filter
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
 )
 
 if(VIDEOCREATOR_FFMPEG_LINK_AVAILABLE)
